@@ -15,6 +15,20 @@ pub struct Attribute {
     pub args: Vec<AttributeArg>,
     pub args_stable_ptr: ast::OptionArgListParenthesizedPtr,
 }
+impl Attribute {
+    /// Checks if the given attribute has a single argument with the given name.
+    pub fn is_single_unnamed_arg(&self, db: &dyn SyntaxGroup, arg_name: &str) -> bool {
+        match &self.args[..] {
+            [arg] => match &arg.variant {
+                AttributeArgVariant::Unnamed { value, .. } => {
+                    value.as_syntax_node().get_text_without_trivia(db) == arg_name
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
 
 /// Easier to digest representation of a single attribute value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,10 +93,10 @@ impl AttributeStructurize for ast::Attribute {
             args: match attr_args {
                 ast::OptionArgListParenthesized::ArgListParenthesized(ref attribute_args) => {
                     attribute_args
-                        .args(db)
+                        .arguments(db)
                         .elements(db)
                         .into_iter()
-                        .map(|arg| AttributeArg::from(arg, db))
+                        .map(|arg| AttributeArg::from_ast(arg, db))
                         .collect()
                 }
                 ast::OptionArgListParenthesized::Empty(_) => vec![],
@@ -106,7 +120,7 @@ impl AttributeListStructurize for ast::AttributeList {
 
 impl AttributeArg {
     /// Build [`AttributeArg`] from [`ast::Arg`].
-    fn from(arg: ast::Arg, db: &dyn SyntaxGroup) -> AttributeArg {
+    pub fn from_ast(arg: ast::Arg, db: &dyn SyntaxGroup) -> AttributeArg {
         let variant = match arg.arg_clause(db) {
             ast::ArgClause::Unnamed(clause) => {
                 let value = clause.value(db);
@@ -140,6 +154,20 @@ impl AttributeArg {
 
         let arg_stable_ptr = arg.stable_ptr();
         AttributeArg { variant, arg, arg_stable_ptr, modifiers }
+    }
+
+    pub fn text(&self, db: &dyn SyntaxGroup) -> String {
+        match &self.variant {
+            AttributeArgVariant::Unnamed { value, .. } => {
+                value.as_syntax_node().get_text_without_trivia(db)
+            }
+            AttributeArgVariant::Named { value, name, .. } => {
+                format!("{}: {}", name, value.as_syntax_node().get_text_without_trivia(db))
+            }
+            AttributeArgVariant::FieldInitShorthand { name, .. } => {
+                format!(":{}", name)
+            }
+        }
     }
 }
 

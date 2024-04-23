@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cairo_lang_defs::ids::{LanguageElementId, UseId};
+use cairo_lang_defs::ids::{LanguageElementId, LookupItemId, ModuleItemId, UseId};
 use cairo_lang_diagnostics::{Diagnostics, Maybe, ToMaybe};
 use cairo_lang_proc_macros::DebugWithDb;
 use cairo_lang_syntax::node::db::SyntaxGroup;
@@ -11,6 +11,7 @@ use cairo_lang_utils::Upcast;
 use crate::db::SemanticGroup;
 use crate::diagnostic::SemanticDiagnosticKind::*;
 use crate::diagnostic::{NotFoundItemType, SemanticDiagnostics};
+use crate::expr::inference::InferenceId;
 use crate::resolve::{ResolvedGenericItem, Resolver, ResolverData};
 use crate::SemanticDiagnostic;
 
@@ -25,14 +26,15 @@ pub struct UseData {
 /// Query implementation of [crate::db::SemanticGroup::priv_use_semantic_data].
 pub fn priv_use_semantic_data(db: &dyn SemanticGroup, use_id: UseId) -> Maybe<UseData> {
     let module_file_id = use_id.module_file_id(db.upcast());
-    let mut diagnostics = SemanticDiagnostics::new(module_file_id);
+    let mut diagnostics = SemanticDiagnostics::new(module_file_id.file_id(db.upcast())?);
     // TODO(spapini): Add generic args when they are supported on structs.
-    let mut resolver = Resolver::new(db, module_file_id);
+    let inference_id =
+        InferenceId::LookupItemDeclaration(LookupItemId::ModuleItem(ModuleItemId::Use(use_id)));
+    let mut resolver = Resolver::new(db, module_file_id, inference_id);
     // TODO(spapini): when code changes in a file, all the AST items change (as they contain a path
     // to the green root that changes. Once ASTs are rooted on items, use a selector that picks only
     // the item instead of all the module data.
-    let module_uses = db.module_uses(module_file_id.0)?;
-    let use_ast = module_uses.get(&use_id).to_maybe()?;
+    let use_ast = db.module_use_by_id(use_id)?.to_maybe()?;
     let mut segments = vec![];
     get_use_segments(db.upcast(), &ast::UsePath::Leaf(use_ast.clone()), &mut segments)?;
     let resolved_item =
@@ -48,10 +50,11 @@ pub fn get_use_segments(
     use_path: &ast::UsePath,
     segments: &mut Vec<ast::PathSegment>,
 ) -> Maybe<()> {
-    // Find parent path.
+    // Add parent's segments.
     if let Some(parent_use_path) = get_parent_use_path(db, use_path) {
         get_use_segments(db, &parent_use_path, segments)?;
     }
+    // Add current segment.
     match use_path {
         ast::UsePath::Leaf(use_ast) => {
             segments.push(use_ast.ident(db));
@@ -68,20 +71,23 @@ pub fn get_use_segments(
 fn get_parent_use_path(db: &dyn SyntaxGroup, use_path: &ast::UsePath) -> Option<ast::UsePath> {
     let mut node = use_path.as_syntax_node();
     loop {
-        node = node.parent()?;
+        node = node.parent().expect("UsePath is not under an ItemUse.");
         return match node.kind(db) {
             SyntaxKind::ItemUse => None,
-            SyntaxKind::UsePathLeaf => {
-                Some(ast::UsePath::Leaf(ast::UsePathLeaf::from_syntax_node(db, node)))
-            }
             SyntaxKind::UsePathSingle => {
                 Some(ast::UsePath::Single(ast::UsePathSingle::from_syntax_node(db, node)))
             }
             SyntaxKind::UsePathMulti => {
                 Some(ast::UsePath::Multi(ast::UsePathMulti::from_syntax_node(db, node)))
             }
-            _ => {
+            SyntaxKind::UsePathList => {
                 continue;
+            }
+            SyntaxKind::UsePathLeaf => {
+                unreachable!("UsePathLeaf can't be a parent of another UsePath.");
+            }
+            _ => {
+                unreachable!();
             }
         };
     }
@@ -94,11 +100,10 @@ pub fn priv_use_semantic_data_cycle(
     use_id: &UseId,
 ) -> Maybe<UseData> {
     let module_file_id = use_id.module_file_id(db.upcast());
-    let mut diagnostics = SemanticDiagnostics::new(module_file_id);
-    let module_uses = db.module_uses(module_file_id.0)?;
-    let use_ast = module_uses.get(use_id).to_maybe()?;
+    let mut diagnostics = SemanticDiagnostics::new(module_file_id.file_id(db.upcast())?);
+    let use_ast = db.module_use_by_id(*use_id)?.to_maybe()?;
     let err = Err(diagnostics.report(
-        use_ast,
+        &use_ast,
         if cycle.len() == 1 {
             // `use bad_name`, finds itself but we don't want to report a cycle in that case.
             PathNotFound(NotFoundItemType::Identifier)
@@ -106,10 +111,12 @@ pub fn priv_use_semantic_data_cycle(
             UseCycle
         },
     ));
+    let inference_id =
+        InferenceId::LookupItemDeclaration(LookupItemId::ModuleItem(ModuleItemId::Use(*use_id)));
     Ok(UseData {
         diagnostics: diagnostics.build(),
         resolved_item: err,
-        resolver_data: Arc::new(ResolverData::new(module_file_id)),
+        resolver_data: Arc::new(ResolverData::new(module_file_id, inference_id)),
     })
 }
 
@@ -126,8 +133,18 @@ pub fn use_resolver_data(db: &dyn SemanticGroup, use_id: UseId) -> Maybe<Arc<Res
     Ok(db.priv_use_semantic_data(use_id)?.resolver_data)
 }
 
+/// Trivial cycle handler for [crate::db::SemanticGroup::use_resolver_data].
+pub fn use_resolver_data_cycle(
+    db: &dyn SemanticGroup,
+    _cycle: &[String],
+    use_id: &UseId,
+) -> Maybe<Arc<ResolverData>> {
+    // Forwarding (not as a query) cycle handling to `priv_use_semantic_data` cycle handler.
+    use_resolver_data(db, *use_id)
+}
+
 pub trait SemanticUseEx<'a>: Upcast<dyn SemanticGroup + 'a> {
-    /// Returns the resolved items.
+    /// Returns the resolved item or an error if it can't be resolved.
     ///
     /// This is not a query as the cycle handling is done in priv_use_semantic_data.
     fn use_resolved_item(&self, use_id: UseId) -> Maybe<ResolvedGenericItem> {

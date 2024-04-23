@@ -20,16 +20,24 @@ pub enum ParserDiagnosticKind {
     MissingPathSegment,
     MissingTypeClause,
     MissingTypeExpression,
+    MissingWrappedArgList,
+    MissingPatteren,
+    ItemInlineMacroWithoutBang { identifier: SmolStr, bracket_type: SyntaxKind },
     ReservedIdentifier { identifier: SmolStr },
     UnderscoreNotAllowedAsIdentifier,
     MissingLiteralSuffix,
     InvalidNumericLiteralValue,
     IllegalStringEscaping,
     ShortStringMustBeAscii,
+    StringMustBeAscii,
+    UnterminatedShortString,
     UnterminatedString,
+    VisibilityWithoutItem,
     AttributesWithoutItem,
     AttributesWithoutTraitItem,
     AttributesWithoutImplItem,
+    AttributesWithoutStatement,
+    DisallowedTrailingSeparatorOr,
 }
 impl DiagnosticEntry for ParserDiagnostic {
     type DbType = dyn FilesGroup;
@@ -54,6 +62,25 @@ impl DiagnosticEntry for ParserDiagnostic {
             ParserDiagnosticKind::MissingTypeExpression => {
                 "Missing tokens. Expected a type expression.".to_string()
             }
+            ParserDiagnosticKind::MissingWrappedArgList => "Missing tokens. Expected an argument \
+                                                            list wrapped in either parentheses, \
+                                                            brackets, or braces."
+                .to_string(),
+            ParserDiagnosticKind::MissingPatteren => {
+                "Missing tokens. Expected a pattern.".to_string()
+            }
+            ParserDiagnosticKind::ItemInlineMacroWithoutBang { identifier, bracket_type } => {
+                let (left, right) = match bracket_type {
+                    SyntaxKind::TerminalLParen => ("(", ")"),
+                    SyntaxKind::TerminalLBrack => ("[", "]"),
+                    SyntaxKind::TerminalLBrace => ("{", "}"),
+                    _ => ("", ""),
+                };
+                format!(
+                    "Expected a '!' after the identifier '{identifier}' to start an inline macro.
+Did you mean to write `{identifier}!{left}...{right}'?",
+                )
+            }
             ParserDiagnosticKind::ReservedIdentifier { identifier } => {
                 format!("'{identifier}' is a reserved identifier.")
             }
@@ -66,9 +93,18 @@ impl DiagnosticEntry for ParserDiagnostic {
             }
             ParserDiagnosticKind::IllegalStringEscaping => "Invalid string escaping.".to_string(),
             ParserDiagnosticKind::ShortStringMustBeAscii => {
-                "Short strings can only include ASCII characters.".into()
+                "Short string literals can only include ASCII characters.".into()
+            }
+            ParserDiagnosticKind::StringMustBeAscii => {
+                "String literals can only include ASCII characters.".into()
+            }
+            ParserDiagnosticKind::UnterminatedShortString => {
+                "Unterminated short string literal.".into()
             }
             ParserDiagnosticKind::UnterminatedString => "Unterminated string literal.".into(),
+            ParserDiagnosticKind::VisibilityWithoutItem => {
+                "Missing tokens. Expected an item after visibility.".to_string()
+            }
             ParserDiagnosticKind::AttributesWithoutItem => {
                 "Missing tokens. Expected an item after attributes.".to_string()
             }
@@ -77,6 +113,12 @@ impl DiagnosticEntry for ParserDiagnostic {
             }
             ParserDiagnosticKind::AttributesWithoutImplItem => {
                 "Missing tokens. Expected an impl item after attributes.".to_string()
+            }
+            ParserDiagnosticKind::AttributesWithoutStatement => {
+                "Missing tokens. Expected a statement after attributes.".to_string()
+            }
+            ParserDiagnosticKind::DisallowedTrailingSeparatorOr => {
+                "A trailing `|` is not allowed in an or-pattern.".to_string()
             }
         }
     }

@@ -15,6 +15,7 @@ pub fn get_type_size_map(
     let mut type_sizes = TypeSizeMap::default();
     for declaration in &program.type_declarations {
         let size = match registry.get_type(&declaration.id).ok()? {
+            CoreTypeConcrete::Coupon(_) => Some(0),
             CoreTypeConcrete::Felt252(_)
             | CoreTypeConcrete::GasBuiltin(_)
             | CoreTypeConcrete::Bitwise(_)
@@ -26,6 +27,11 @@ pub fn get_type_size_map(
             | CoreTypeConcrete::Uint32(_)
             | CoreTypeConcrete::Uint64(_)
             | CoreTypeConcrete::Uint128(_)
+            | CoreTypeConcrete::Sint8(_)
+            | CoreTypeConcrete::Sint16(_)
+            | CoreTypeConcrete::Sint32(_)
+            | CoreTypeConcrete::Sint64(_)
+            | CoreTypeConcrete::Sint128(_)
             | CoreTypeConcrete::RangeCheck(_)
             | CoreTypeConcrete::Box(_)
             | CoreTypeConcrete::StarkNet(StarkNetTypeConcrete::System(_))
@@ -34,11 +40,14 @@ pub fn get_type_size_map(
             | CoreTypeConcrete::StarkNet(StarkNetTypeConcrete::ContractAddress(_))
             | CoreTypeConcrete::StarkNet(StarkNetTypeConcrete::ClassHash(_))
             | CoreTypeConcrete::StarkNet(StarkNetTypeConcrete::Secp256Point(_))
+            | CoreTypeConcrete::StarkNet(StarkNetTypeConcrete::SHA256StateHandle(_))
             | CoreTypeConcrete::Pedersen(_)
             | CoreTypeConcrete::Poseidon(_)
             | CoreTypeConcrete::Felt252Dict(_)
             | CoreTypeConcrete::Felt252DictEntry(_)
-            | CoreTypeConcrete::SegmentArena(_) => Some(1),
+            | CoreTypeConcrete::SegmentArena(_)
+            | CoreTypeConcrete::Bytes31(_)
+            | CoreTypeConcrete::BoundedInt(_) => Some(1),
             CoreTypeConcrete::Array(_)
             | CoreTypeConcrete::Span(_)
             | CoreTypeConcrete::EcPoint(_)
@@ -64,6 +73,8 @@ pub fn get_type_size_map(
                 }
                 Some(size)
             }
+            // Const types are not moved around and should not have a size.
+            CoreTypeConcrete::Const(_) => continue,
         }?;
         type_sizes.insert(declaration.id.clone(), size);
     }

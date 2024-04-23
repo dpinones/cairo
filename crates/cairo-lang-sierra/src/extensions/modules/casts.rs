@@ -1,9 +1,8 @@
-use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
+use cairo_felt::Felt252;
+use num_traits::Zero;
 
-use super::int::unsigned::{Uint16Type, Uint32Type, Uint64Type, Uint8Type};
-use super::int::unsigned128::Uint128Type;
 use super::range_check::RangeCheckType;
-use super::utils::reinterpret_cast_signature;
+use super::utils::{reinterpret_cast_signature, Range};
 use crate::define_libfunc_hierarchy;
 use crate::extensions::lib_func::{
     BranchSignature, LibfuncSignature, OutputVarInfo, ParamSignature, SierraApChange,
@@ -23,38 +22,13 @@ define_libfunc_hierarchy! {
     }, CastConcreteLibfunc
 }
 
-/// Returns a map from (concrete) integer type to the number of bits in the type.
-fn get_type_to_nbits_map(
-    context: &dyn SignatureSpecializationContext,
-) -> UnorderedHashMap<ConcreteTypeId, usize> {
-    vec![
-        (Uint8Type::ID, 8),
-        (Uint16Type::ID, 16),
-        (Uint32Type::ID, 32),
-        (Uint64Type::ID, 64),
-        (Uint128Type::ID, 128),
-    ]
-    .into_iter()
-    .filter_map(|(generic_type, n_bits)| {
-        Some((context.get_concrete_type(generic_type, &[]).ok()?, n_bits))
-    })
-    .collect()
-}
-
-/// Returns the number of bits for the given types.
-// TODO(lior): Convert to a generic function that can take arbitrary number of arguments once
-//   `try_map` is a stable feature.
-fn get_n_bits(
-    context: &dyn SignatureSpecializationContext,
-    from_type: &ConcreteTypeId,
-    to_type: &ConcreteTypeId,
-) -> Result<(usize, usize), SpecializationError> {
-    let type_to_n_bits = get_type_to_nbits_map(context);
-    let from_nbits =
-        *type_to_n_bits.get(from_type).ok_or(SpecializationError::UnsupportedGenericArg)?;
-    let to_nbits =
-        *type_to_n_bits.get(to_type).ok_or(SpecializationError::UnsupportedGenericArg)?;
-    Ok((from_nbits, to_nbits))
+/// The type of casting between two integer types.
+#[derive(PartialEq, Eq)]
+pub struct CastType {
+    /// Does the source type have values above the destination type possible values.
+    pub overflow_above: bool,
+    /// Does the source type have values below the destination type possible values.
+    pub overflow_below: bool,
 }
 
 /// Libfunc for casting from one type to another where any input value can fit into the destination
@@ -70,13 +44,12 @@ impl SignatureOnlyGenericLibfunc for UpcastLibfunc {
         args: &[GenericArg],
     ) -> Result<LibfuncSignature, SpecializationError> {
         let (from_ty, to_ty) = args_as_two_types(args)?;
-        let (from_nbits, to_nbits) = get_n_bits(context, &from_ty, &to_ty)?;
-
-        let is_valid = from_nbits <= to_nbits;
-        if !is_valid {
+        let from_range = Range::from_type(context, from_ty.clone())?;
+        let to_range: Range = Range::from_type(context, to_ty.clone())?;
+        let is_upcast = to_range.lower <= from_range.lower && from_range.upper <= to_range.upper;
+        if !is_upcast {
             return Err(SpecializationError::UnsupportedGenericArg);
         }
-
         Ok(reinterpret_cast_signature(from_ty, to_ty))
     }
 }
@@ -85,10 +58,25 @@ impl SignatureOnlyGenericLibfunc for UpcastLibfunc {
 pub struct DowncastConcreteLibfunc {
     pub signature: LibfuncSignature,
     pub from_ty: ConcreteTypeId,
-    pub from_nbits: usize,
+    pub from_range: Range,
     pub to_ty: ConcreteTypeId,
-    pub to_nbits: usize,
+    pub to_range: Range,
 }
+impl DowncastConcreteLibfunc {
+    /// Returns the cast type.
+    pub fn cast_type(&self) -> CastType {
+        if self.from_ty == self.to_ty && self.from_range.lower.is_zero() {
+            // Backwards compatibility for the case of casting an unsigned type to itself.
+            CastType { overflow_above: true, overflow_below: false }
+        } else {
+            CastType {
+                overflow_above: self.to_range.upper < self.from_range.upper,
+                overflow_below: self.to_range.lower > self.from_range.lower,
+            }
+        }
+    }
+}
+
 impl SignatureBasedConcreteLibfunc for DowncastConcreteLibfunc {
     fn signature(&self) -> &LibfuncSignature {
         &self.signature
@@ -109,10 +97,29 @@ impl NamedLibfunc for DowncastLibfunc {
         args: &[GenericArg],
     ) -> Result<LibfuncSignature, SpecializationError> {
         let (from_ty, to_ty) = args_as_two_types(args)?;
-        let (from_nbits, to_nbits) = get_n_bits(context, &from_ty, &to_ty)?;
+        let to_range = Range::from_type(context, to_ty.clone())?;
+        let from_range = Range::from_type(context, from_ty.clone())?;
+        // Shrinking the range of the destination type by the range of the source type.
+        // This is necessary for example in the case `[0, PRIME) -> i8`.
+        // In this case `PRIME - 1` is a valid value in `from_range` and it is equivalent
+        // to `-1` in the field. Yet, we must make sure `PRIME - 1` is not downcasted to `-1`.
+        // By reducing `to_range`, we get a cast `[0, PRIME) -> [0, 128)` where `-1` is not
+        // in the output range.
+        //
+        // Note that the call to `intersection` additionally disallows disjoint ranges.
+        let to_range =
+            to_range.intersection(&from_range).ok_or(SpecializationError::UnsupportedGenericArg)?;
 
-        let is_valid = from_nbits >= to_nbits;
-        if !is_valid {
+        // Currently, we only support downcasting into `RangeCheck` sized types.
+        if !to_range.is_small_range() {
+            return Err(SpecializationError::UnsupportedGenericArg);
+        }
+        let is_small_values_downcast = from_range.is_small_range();
+        // Only allow `size < prime % u128::MAX` so that we can safely use `K=2` in
+        // `validate_under_limit`.
+        let is_felt252_valid_downcast = from_range.is_full_felt252_range()
+            && to_range.size() < (Felt252::prime() % u128::MAX).into();
+        if !(is_small_values_downcast || is_felt252_valid_downcast) {
             return Err(SpecializationError::UnsupportedGenericArg);
         }
 
@@ -151,14 +158,17 @@ impl NamedLibfunc for DowncastLibfunc {
         args: &[GenericArg],
     ) -> Result<Self::Concrete, SpecializationError> {
         let (from_ty, to_ty) = args_as_two_types(args)?;
-        let (from_nbits, to_nbits) = get_n_bits(context.upcast(), &from_ty, &to_ty)?;
-
+        let from_range = Range::from_type(context.upcast(), from_ty.clone())?;
+        // Shrinking the range of the destination type by the range of the source type.
+        let to_range: Range = Range::from_type(context.upcast(), to_ty.clone())?
+            .intersection(&from_range)
+            .ok_or(SpecializationError::UnsupportedGenericArg)?;
         Ok(DowncastConcreteLibfunc {
             signature: self.specialize_signature(context.upcast(), args)?,
+            from_range,
             from_ty,
-            from_nbits,
+            to_range,
             to_ty,
-            to_nbits,
         })
     }
 }

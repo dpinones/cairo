@@ -19,15 +19,15 @@ ret;
 test::foo: OrderedHashMap({Const: 200})
 
 //! > sierra_code
-type Unit = Struct<ut@Tuple>;
-type core::bool = Enum<ut@core::bool, Unit, Unit>;
+type Unit = Struct<ut@Tuple> [storable: true, drop: true, dup: true, zero_sized: true];
+type core::bool = Enum<ut@core::bool, Unit, Unit> [storable: true, drop: true, dup: true, zero_sized: false];
 
 libfunc bool_xor_impl = bool_xor_impl;
 libfunc store_temp<core::bool> = store_temp<core::bool>;
 
-bool_xor_impl([0], [1]) -> ([2]);
-store_temp<core::bool>([2]) -> ([3]);
-return([3]);
+bool_xor_impl([0], [1]) -> ([2]); // 0
+store_temp<core::bool>([2]) -> ([2]); // 1
+return([2]); // 2
 
 test::foo@0([0]: core::bool, [1]: core::bool) -> (core::bool);
 
@@ -55,15 +55,15 @@ ret;
 test::foo: OrderedHashMap({Const: 300})
 
 //! > sierra_code
-type Unit = Struct<ut@Tuple>;
-type core::bool = Enum<ut@core::bool, Unit, Unit>;
+type Unit = Struct<ut@Tuple> [storable: true, drop: true, dup: true, zero_sized: true];
+type core::bool = Enum<ut@core::bool, Unit, Unit> [storable: true, drop: true, dup: true, zero_sized: false];
 
 libfunc bool_or_impl = bool_or_impl;
 libfunc store_temp<core::bool> = store_temp<core::bool>;
 
-bool_or_impl([0], [1]) -> ([2]);
-store_temp<core::bool>([2]) -> ([3]);
-return([3]);
+bool_or_impl([0], [1]) -> ([2]); // 0
+store_temp<core::bool>([2]) -> ([2]); // 1
+return([2]); // 2
 
 test::foo@0([0]: core::bool, [1]: core::bool) -> (core::bool);
 
@@ -89,15 +89,15 @@ ret;
 test::foo: OrderedHashMap({Const: 100})
 
 //! > sierra_code
-type Unit = Struct<ut@Tuple>;
-type core::bool = Enum<ut@core::bool, Unit, Unit>;
+type Unit = Struct<ut@Tuple> [storable: true, drop: true, dup: true, zero_sized: true];
+type core::bool = Enum<ut@core::bool, Unit, Unit> [storable: true, drop: true, dup: true, zero_sized: false];
 
 libfunc bool_and_impl = bool_and_impl;
 libfunc store_temp<core::bool> = store_temp<core::bool>;
 
-bool_and_impl([0], [1]) -> ([2]);
-store_temp<core::bool>([2]) -> ([3]);
-return([3]);
+bool_and_impl([0], [1]) -> ([2]); // 0
+store_temp<core::bool>([2]) -> ([2]); // 1
+return([2]); // 2
 
 test::foo@0([0]: core::bool, [1]: core::bool) -> (core::bool);
 
@@ -125,15 +125,15 @@ ret;
 test::foo: OrderedHashMap({Const: 200})
 
 //! > sierra_code
-type Unit = Struct<ut@Tuple>;
-type core::bool = Enum<ut@core::bool, Unit, Unit>;
+type Unit = Struct<ut@Tuple> [storable: true, drop: true, dup: true, zero_sized: true];
+type core::bool = Enum<ut@core::bool, Unit, Unit> [storable: true, drop: true, dup: true, zero_sized: false];
 
 libfunc bool_not_impl = bool_not_impl;
 libfunc store_temp<core::bool> = store_temp<core::bool>;
 
-bool_not_impl([0]) -> ([1]);
-store_temp<core::bool>([1]) -> ([2]);
-return([2]);
+bool_not_impl([0]) -> ([1]); // 0
+store_temp<core::bool>([1]) -> ([1]); // 1
+return([1]); // 2
 
 test::foo@0([0]: core::bool) -> (core::bool);
 
@@ -160,15 +160,15 @@ ret;
 test::foo: OrderedHashMap({Const: 100})
 
 //! > sierra_code
-type Unit = Struct<ut@Tuple>;
-type core::bool = Enum<ut@core::bool, Unit, Unit>;
-type felt252 = felt252;
+type Unit = Struct<ut@Tuple> [storable: true, drop: true, dup: true, zero_sized: true];
+type core::bool = Enum<ut@core::bool, Unit, Unit> [storable: true, drop: true, dup: true, zero_sized: false];
+type felt252 = felt252 [storable: true, drop: true, dup: true, zero_sized: false];
 
 libfunc bool_to_felt252 = bool_to_felt252;
 libfunc store_temp<felt252> = store_temp<felt252>;
 
-bool_to_felt252([0]) -> ([1]);
-store_temp<felt252>([1]) -> ([2]);
-return([2]);
+bool_to_felt252([0]) -> ([1]); // 0
+store_temp<felt252>([1]) -> ([1]); // 1
+return([1]); // 2
 
 test::foo@0([0]: core::bool) -> (felt252);

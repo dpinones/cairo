@@ -6,7 +6,7 @@ use cairo_lang_semantic::corelib::{get_core_enum_concrete_variant, get_panic_ty}
 use cairo_lang_semantic::GenericArgumentId;
 use cairo_lang_utils::Upcast;
 use itertools::{chain, zip_eq, Itertools};
-use semantic::{ConcreteVariant, TypeId};
+use semantic::{ConcreteVariant, MatchArmSelector, TypeId};
 
 use crate::blocks::FlatBlocksBuilder;
 use crate::db::{ConcreteSCCRepresentative, LoweringGroup};
@@ -14,9 +14,9 @@ use crate::graph_algorithms::strongly_connected_components::concrete_function_wi
 use crate::ids::{ConcreteFunctionWithBodyId, FunctionId, Signature};
 use crate::lower::context::{VarRequest, VariableAllocator};
 use crate::{
-    BlockId, FlatBlock, FlatBlockEnd, FlatLowered, MatchArm, MatchEnumInfo, MatchInfo, Statement,
-    StatementCall, StatementEnumConstruct, StatementStructConstruct, StatementStructDestructure,
-    VarRemapping, VariableId,
+    BlockId, DependencyType, FlatBlock, FlatBlockEnd, FlatLowered, MatchArm, MatchEnumInfo,
+    MatchInfo, Statement, StatementCall, StatementEnumConstruct, StatementStructConstruct,
+    StatementStructDestructure, VarRemapping, VarUsage, VariableId,
 };
 
 // TODO(spapini): Remove tuple in the Ok() variant of the panic, by supporting multiple values in
@@ -183,7 +183,7 @@ impl<'a> PanicBlockLoweringContext<'a> {
     fn handle_call_panic(&mut self, call: &StatementCall) -> Maybe<(BlockId, FlatBlockEnd)> {
         // Extract return variable.
         let mut original_outputs = call.outputs.clone();
-        let location = self.ctx.variables.variables[original_outputs[0]].location;
+        let location = call.location.with_auto_generation_note(self.db(), "Panic handling");
 
         // Get callee info.
         let callee_signature = call.function.signature(self.ctx.variables.db)?;
@@ -209,6 +209,7 @@ impl<'a> PanicBlockLoweringContext<'a> {
         self.statements.push(Statement::Call(StatementCall {
             function: call.function,
             inputs: call.inputs.clone(),
+            with_coupon: call.with_coupon,
             outputs: call_outputs,
             location,
         }));
@@ -222,33 +223,40 @@ impl<'a> PanicBlockLoweringContext<'a> {
         // complete it.
         let block_ok = self.ctx.enqueue_block(FlatBlock {
             statements: vec![Statement::StructDestructure(StatementStructDestructure {
-                input: inner_ok_value,
+                input: VarUsage { var_id: inner_ok_value, location },
                 outputs: inner_ok_values.clone(),
             })],
             end: FlatBlockEnd::Goto(
                 block_continuation,
-                VarRemapping { remapping: zip_eq(original_outputs, inner_ok_values).collect() },
+                VarRemapping {
+                    remapping: zip_eq(
+                        original_outputs,
+                        inner_ok_values.into_iter().map(|var_id| VarUsage { var_id, location }),
+                    )
+                    .collect(),
+                },
             ),
         });
 
         // Prepare Err() match arm block.
         let err_var = self.new_var(VarRequest { ty: self.ctx.panic_info.err_variant.ty, location });
-        let block_err = self
-            .ctx
-            .enqueue_block(FlatBlock { statements: vec![], end: FlatBlockEnd::Panic(err_var) });
+        let block_err = self.ctx.enqueue_block(FlatBlock {
+            statements: vec![],
+            end: FlatBlockEnd::Panic(VarUsage { var_id: err_var, location }),
+        });
 
         let cur_block_end = FlatBlockEnd::Match {
             info: MatchInfo::Enum(MatchEnumInfo {
                 concrete_enum_id: callee_info.ok_variant.concrete_enum_id,
-                input: panic_result_var,
+                input: VarUsage { var_id: panic_result_var, location },
                 arms: vec![
                     MatchArm {
-                        variant_id: callee_info.ok_variant,
+                        arm_selector: MatchArmSelector::VariantId(callee_info.ok_variant),
                         block_id: block_ok,
                         var_ids: vec![inner_ok_value],
                     },
                     MatchArm {
-                        variant_id: callee_info.err_variant,
+                        arm_selector: MatchArmSelector::VariantId(callee_info.err_variant),
                         block_id: block_err,
                         var_ids: vec![err_var],
                     },
@@ -266,18 +274,16 @@ impl<'a> PanicBlockLoweringContext<'a> {
             FlatBlockEnd::Panic(err_data) => {
                 // Wrap with PanicResult::Err.
                 let ty = self.ctx.panic_info.panic_ty;
-                let location = self.ctx.variables[err_data].location;
+                let location = err_data.location;
                 let output = self.new_var(VarRequest { ty, location });
                 self.statements.push(Statement::EnumConstruct(StatementEnumConstruct {
                     variant: self.ctx.panic_info.err_variant.clone(),
                     input: err_data,
                     output,
                 }));
-                FlatBlockEnd::Return(vec![output])
+                FlatBlockEnd::Return(vec![VarUsage { var_id: output, location }], location)
             }
-            FlatBlockEnd::Return(returns) => {
-                let location = self.ctx.variables[returns[0]].location;
-
+            FlatBlockEnd::Return(returns, location) => {
                 // Tuple construction.
                 let tupled_res =
                     self.new_var(VarRequest { ty: self.ctx.panic_info.ok_ty, location });
@@ -291,10 +297,10 @@ impl<'a> PanicBlockLoweringContext<'a> {
                 let output = self.new_var(VarRequest { ty, location });
                 self.statements.push(Statement::EnumConstruct(StatementEnumConstruct {
                     variant: self.ctx.panic_info.ok_variant.clone(),
-                    input: tupled_res,
+                    input: VarUsage { var_id: tupled_res, location },
                     output,
                 }));
-                FlatBlockEnd::Return(vec![output])
+                FlatBlockEnd::Return(vec![VarUsage { var_id: output, location }], location)
             }
             FlatBlockEnd::NotSet => unreachable!(),
             FlatBlockEnd::Match { info } => FlatBlockEnd::Match { info },
@@ -318,8 +324,9 @@ pub fn function_may_panic(db: &dyn LoweringGroup, function: FunctionId) -> Maybe
 pub trait MayPanicTrait<'a>: Upcast<dyn LoweringGroup + 'a> {
     /// Returns whether a [ConcreteFunctionWithBodyId] may panic.
     fn function_with_body_may_panic(&self, function: ConcreteFunctionWithBodyId) -> Maybe<bool> {
-        let scc_representative =
-            self.upcast().concrete_function_with_body_scc_representative(function);
+        let scc_representative = self
+            .upcast()
+            .concrete_function_with_body_scc_representative(function, DependencyType::Call);
         self.upcast().scc_may_panic(scc_representative)
     }
 }
@@ -328,7 +335,7 @@ impl<'a, T: Upcast<dyn LoweringGroup + 'a> + ?Sized> MayPanicTrait<'a> for T {}
 /// Query implementation of [crate::db::LoweringGroup::scc_may_panic].
 pub fn scc_may_panic(db: &dyn LoweringGroup, scc: ConcreteSCCRepresentative) -> Maybe<bool> {
     // Find the SCC representative.
-    let scc_functions = concrete_function_with_body_scc(db, scc.0);
+    let scc_functions = concrete_function_with_body_scc(db, scc.0, DependencyType::Call);
     for function in scc_functions {
         if db.needs_withdraw_gas(function)? {
             return Ok(true);
@@ -337,10 +344,14 @@ pub fn scc_may_panic(db: &dyn LoweringGroup, scc: ConcreteSCCRepresentative) -> 
             return Ok(true);
         }
         // For each direct callee, find if it may panic.
-        let direct_callees = db.concrete_function_with_body_direct_callees(function)?;
+        let direct_callees =
+            db.concrete_function_with_body_direct_callees(function, DependencyType::Call)?;
         for direct_callee in direct_callees {
             if let Some(callee_body) = direct_callee.body(db.upcast())? {
-                let callee_scc = db.concrete_function_with_body_scc_representative(callee_body);
+                let callee_scc = db.concrete_function_with_body_scc_representative(
+                    callee_body,
+                    DependencyType::Call,
+                );
                 if callee_scc != scc && db.scc_may_panic(callee_scc)? {
                     return Ok(true);
                 }

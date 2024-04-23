@@ -27,6 +27,18 @@ fn terminal_kind_to_text(kind: SyntaxKind) -> Vec<&'static str> {
                 "0xA2_u128",
             ]
         }
+        SyntaxKind::TerminalShortString => {
+            vec!["''", "'a'", "'abc'", "'1234567890123456789012345678901'"]
+        }
+        SyntaxKind::TerminalString => {
+            vec![
+                "\"\"",
+                "\"a\"",
+                "\"abc\"",
+                "\"1234567890123456789012345678901\"",
+                "\"12345678901234567890123456789012\"",
+            ]
+        }
         SyntaxKind::TerminalFalse => vec!["false"],
         SyntaxKind::TerminalExtern => vec!["extern"],
         SyntaxKind::TerminalType => vec!["type"],
@@ -165,6 +177,8 @@ fn terminal_kinds() -> Vec<SyntaxKind> {
         SyntaxKind::TerminalArrow,
         SyntaxKind::TerminalMatchArrow,
         SyntaxKind::TerminalEndOfFile,
+        SyntaxKind::TerminalShortString,
+        SyntaxKind::TerminalString,
     ]
 }
 
@@ -184,6 +198,16 @@ fn need_separator(
         return true;
     }
     if kind0 == SyntaxKind::TerminalLiteralNumber && (kind0 == kind1 || is_identifier_like(kind1)) {
+        return true;
+    }
+    if kind0 == SyntaxKind::TerminalShortString
+        && matches!(kind1, SyntaxKind::TerminalIdentifier | SyntaxKind::TerminalUnderscore)
+    {
+        return true;
+    }
+    if kind0 == SyntaxKind::TerminalShortString
+        && matches!(kind1, SyntaxKind::TerminalIdentifier | SyntaxKind::TerminalUnderscore)
+    {
         return true;
     }
     if (text0 == "&" && text1.starts_with('&'))

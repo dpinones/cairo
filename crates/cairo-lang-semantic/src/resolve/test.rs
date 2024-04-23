@@ -3,7 +3,7 @@ use std::sync::Arc;
 use cairo_lang_debug::DebugWithDb;
 use cairo_lang_defs::ids::{FunctionWithBodyId, ModuleId, ModuleItemId};
 use cairo_lang_diagnostics::ToOption;
-use cairo_lang_filesystem::db::{AsFilesGroupMut, FilesGroup, FilesGroupEx};
+use cairo_lang_filesystem::db::{AsFilesGroupMut, CrateConfiguration, FilesGroup, FilesGroupEx};
 use cairo_lang_filesystem::ids::{CrateLongId, Directory, FileLongId};
 use cairo_lang_utils::extract_matches;
 use indoc::indoc;
@@ -16,8 +16,8 @@ use crate::test_utils::{setup_test_module, SemanticDatabaseForTesting};
 
 #[test]
 fn test_resolve_path() {
-    let mut db_val = SemanticDatabaseForTesting::default();
-    let db = &mut db_val;
+    let db_val = SemanticDatabaseForTesting::default();
+    let db = &db_val;
     let test_module = setup_test_module(
         db,
         indoc! {"
@@ -27,7 +27,7 @@ fn test_resolve_path() {
 
             fn foo<Q>(value: S::<felt252>, b: Q, c: Box::<Q>) {
                 bar::<(felt252,Q)>(value);
-                let c = b;
+                let _c = b;
             }
         "},
     )
@@ -44,8 +44,9 @@ fn test_resolve_path() {
         format!("{:?}", body.to_option().debug(&expr_formatter)),
         "Some(Block(ExprBlock { statements: [Expr(StatementExpr { expr: \
          FunctionCall(ExprFunctionCall { function: test::bar::<(core::felt252, Q)>, args: \
-         [Value(Var(ParamId(test::value)))], ty: test::S::<()> }) }), Let(StatementLet { pattern: \
-         Variable(c), expr: Var(ParamId(test::b)) })], tail: None, ty: () }))"
+         [Value(Var(ParamId(test::value)))], coupon_arg: None, ty: test::S::<()> }) }), \
+         Let(StatementLet { pattern: Variable(_c), expr: Var(ParamId(test::b)) })], tail: None, \
+         ty: () }))"
     );
 }
 
@@ -56,12 +57,12 @@ fn set_file_content(db: &mut SemanticDatabaseForTesting, path: &str, content: &s
 
 #[test]
 fn test_resolve_path_super() {
-    let mut db_val = SemanticDatabaseForTesting::default();
+    let mut db_val = SemanticDatabaseForTesting::new_empty();
     let db = &mut db_val;
 
-    let crate_id = db.intern_crate(CrateLongId("test".into()));
-    let root = Directory("src".into());
-    db.set_crate_root(crate_id, Some(root));
+    let crate_id = db.intern_crate(CrateLongId::Real("test".into()));
+    let root = Directory::Real("src".into());
+    db.set_crate_config(crate_id, Some(CrateConfiguration::default_for_root(root)));
 
     // Main module file.
     set_file_content(
@@ -96,18 +97,19 @@ fn test_resolve_path_super() {
     let members = db.struct_members(struct_id).unwrap();
     assert_eq!(
         format!("{:?}", members["a"].debug(db)),
-        "Member { id: MemberId(test::inner2::a), ty: test::inner1::InnerStruct1 }"
+        "Member { id: MemberId(test::inner2::a), ty: test::inner1::InnerStruct1, visibility: \
+         Private }"
     );
     assert_eq!(
         format!("{:?}", members["b"].debug(db)),
-        "Member { id: MemberId(test::inner2::b), ty: test::OuterStruct }"
+        "Member { id: MemberId(test::inner2::b), ty: test::OuterStruct, visibility: Private }"
     );
 }
 
 #[test]
 fn test_resolve_path_trait_impl() {
-    let mut db_val = SemanticDatabaseForTesting::default();
-    let db = &mut db_val;
+    let db_val = SemanticDatabaseForTesting::default();
+    let db = &db_val;
     let test_module = setup_test_module(
         db,
         indoc! {"
@@ -139,7 +141,8 @@ fn test_resolve_path_trait_impl() {
         format!("{:?}", body.to_option().debug(&expr_formatter)),
         "Some(Block(ExprBlock { statements: [], tail: Some(FunctionCall(ExprFunctionCall { \
          function: core::Felt252Add::add, args: [Value(FunctionCall(ExprFunctionCall { function: \
-         test::MyImpl::foo, args: [], ty: core::felt252 })), Value(Literal(ExprLiteral { value: \
-         1, ty: core::felt252 }))], ty: core::felt252 })), ty: core::felt252 }))"
+         test::MyImpl::foo, args: [], coupon_arg: None, ty: core::felt252 })), \
+         Value(Literal(ExprLiteral { value: 1, ty: core::felt252 }))], coupon_arg: None, ty: \
+         core::felt252 })), ty: core::felt252 }))"
     );
 }

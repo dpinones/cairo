@@ -3,8 +3,9 @@ use std::sync::Arc;
 use cairo_lang_defs::ids::FunctionWithBodyId;
 use cairo_lang_diagnostics::{Diagnostics, Maybe, ToMaybe};
 use cairo_lang_proc_macros::DebugWithDb;
+use cairo_lang_syntax::attribute::consts::{IMPLICIT_PRECEDENCE_ATTR, INLINE_ATTR};
 use cairo_lang_syntax::attribute::structured::{Attribute, AttributeArg, AttributeArgVariant};
-use cairo_lang_syntax::node::{ast, TypedSyntaxNode};
+use cairo_lang_syntax::node::{ast, TypedStablePtr, TypedSyntaxNode};
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use cairo_lang_utils::Upcast;
 use id_arena::Arena;
@@ -16,7 +17,7 @@ use crate::db::SemanticGroup;
 use crate::diagnostic::{SemanticDiagnosticKind, SemanticDiagnostics};
 use crate::items::functions::ImplicitPrecedence;
 use crate::resolve::ResolverData;
-use crate::{semantic, ExprId, SemanticDiagnostic, TypeId};
+use crate::{semantic, ExprId, PatternId, SemanticDiagnostic, TypeId};
 
 // === Declaration ===
 
@@ -120,6 +121,7 @@ pub fn function_with_body_attributes(
 pub struct FunctionBodyData {
     pub diagnostics: Diagnostics<SemanticDiagnostic>,
     pub expr_lookup: UnorderedHashMap<ast::ExprPtr, ExprId>,
+    pub pattern_lookup: UnorderedHashMap<ast::PatternPtr, PatternId>,
     pub resolver_data: Arc<ResolverData>,
     pub body: Arc<FunctionBody>,
 }
@@ -128,6 +130,7 @@ pub struct FunctionBodyData {
 #[debug_db(dyn SemanticGroup + 'static)]
 pub struct FunctionBody {
     pub exprs: Arena<semantic::Expr>,
+    pub patterns: Arena<semantic::Pattern>,
     pub statements: Arena<semantic::Statement>,
     pub body_expr: semantic::ExprId,
 }
@@ -184,6 +187,15 @@ pub fn expr_semantic(
     db.function_body(function_id).unwrap().exprs.get(id).unwrap().clone()
 }
 
+/// Query implementation of [crate::db::SemanticGroup::pattern_semantic].
+pub fn pattern_semantic(
+    db: &dyn SemanticGroup,
+    function_id: FunctionWithBodyId,
+    id: semantic::PatternId,
+) -> semantic::Pattern {
+    db.function_body(function_id).unwrap().patterns.get(id).unwrap().clone()
+}
+
 /// Query implementation of [crate::db::SemanticGroup::statement_semantic].
 pub fn statement_semantic(
     db: &dyn SemanticGroup,
@@ -209,6 +221,21 @@ pub trait SemanticExprLookup<'a>: Upcast<dyn SemanticGroup + 'a> {
         };
         body_data?.expr_lookup.get(&ptr).copied().to_maybe()
     }
+    fn lookup_pattern_by_ptr(
+        &self,
+        function_id: FunctionWithBodyId,
+        ptr: ast::PatternPtr,
+    ) -> Maybe<PatternId> {
+        let body_data = match function_id {
+            FunctionWithBodyId::Free(free_function_id) => {
+                self.upcast().priv_free_function_body_data(free_function_id)
+            }
+            FunctionWithBodyId::Impl(impl_function_id) => {
+                self.upcast().priv_impl_function_body_data(impl_function_id)
+            }
+        };
+        body_data?.pattern_lookup.get(&ptr).copied().to_maybe()
+    }
 }
 impl<'a, T: Upcast<dyn SemanticGroup + 'a> + ?Sized> SemanticExprLookup<'a> for T {}
 
@@ -221,7 +248,7 @@ pub fn get_inline_config(
     let mut config = InlineConfiguration::None;
     let mut seen_inline_attr = false;
     for attr in attributes {
-        if attr.id != "inline" {
+        if attr.id != INLINE_ATTR {
             continue;
         }
 
@@ -279,14 +306,12 @@ pub fn get_implicit_precedence<'a>(
 ) -> Maybe<(ImplicitPrecedence, Option<&'a Attribute>)> {
     let syntax_db = db.upcast();
 
-    let mut attributes = attributes.iter().rev().filter(|attr| attr.id == "implicit_precedence");
+    let mut attributes = attributes.iter().rev().filter(|attr| attr.id == IMPLICIT_PRECEDENCE_ATTR);
 
     // Pick the last attribute if any.
-    let Some(attr) = attributes.next() else {
-        return Ok((ImplicitPrecedence::UNSPECIFIED, None))
-    };
+    let Some(attr) = attributes.next() else { return Ok((ImplicitPrecedence::UNSPECIFIED, None)) };
 
-    // Report warnings for overriden attributes if any.
+    // Report warnings for overridden attributes if any.
     for attr in attributes {
         diagnostics.report_by_ptr(
             attr.id_stable_ptr.untyped(),

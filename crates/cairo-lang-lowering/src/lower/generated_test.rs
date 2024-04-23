@@ -2,30 +2,30 @@ use std::fmt::Write;
 
 use cairo_lang_debug::DebugWithDb;
 use cairo_lang_diagnostics::get_location_marks;
-use cairo_lang_plugins::get_default_plugins;
-use cairo_lang_semantic::db::SemanticGroup;
 use cairo_lang_semantic::test_utils::setup_test_function;
+use cairo_lang_test_utils::parse_test_file::TestRunnerResult;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 
 use crate::db::LoweringGroup;
 use crate::fmt::LoweredFormatter;
-use crate::ids::{ConcreteFunctionWithBodyLongId, GeneratedFunction};
+use crate::ids::{ConcreteFunctionWithBodyId, ConcreteFunctionWithBodyLongId, GeneratedFunction};
 use crate::test_utils::LoweringDatabaseForTesting;
 
 cairo_lang_test_utils::test_file_test!(
-    inlining,
+    generated,
     "src/lower/test_data",
     {
         loop_ :"loop",
+        while_ :"while",
     },
     test_generated_function
 );
 
 fn test_generated_function(
     inputs: &OrderedHashMap<String, String>,
-) -> OrderedHashMap<String, String> {
+    _args: &OrderedHashMap<String, String>,
+) -> TestRunnerResult {
     let db = &mut LoweringDatabaseForTesting::default();
-    db.set_semantic_plugins(get_default_plugins());
     let (test_function, semantic_diagnostics) = setup_test_function(
         db,
         inputs["function"].as_str(),
@@ -41,10 +41,21 @@ fn test_generated_function(
         writeln!(
             &mut writer,
             "{:?}",
-            multi_lowering.main_lowering.debug(&LoweredFormatter {
-                db,
-                variables: &multi_lowering.main_lowering.variables
-            })
+            multi_lowering
+                .main_lowering
+                .debug(&LoweredFormatter::new(db, &multi_lowering.main_lowering.variables))
+        )
+        .unwrap();
+
+        let lowering =
+            db.final_concrete_function_with_body_lowered(
+                ConcreteFunctionWithBodyId::from_semantic(db, test_function.concrete_function_id),
+            )
+            .unwrap();
+        writeln!(
+            &mut writer,
+            "Final lowering:\n{:?}",
+            lowering.debug(&LoweredFormatter::new(db, &lowering.variables))
         )
         .unwrap();
 
@@ -69,7 +80,15 @@ fn test_generated_function(
             writeln!(
                 &mut writer,
                 "{:?}",
-                lowering.debug(&LoweredFormatter { db, variables: &lowering.variables })
+                lowering.debug(&LoweredFormatter::new(db, &lowering.variables))
+            )
+            .unwrap();
+
+            let lowering = db.final_concrete_function_with_body_lowered(generated_id).unwrap();
+            writeln!(
+                &mut writer,
+                "Final lowering:\n{:?}",
+                lowering.debug(&LoweredFormatter::new(db, &lowering.variables))
             )
             .unwrap();
         }
@@ -78,9 +97,9 @@ fn test_generated_function(
     let lowering_diagnostics =
         db.module_lowering_diagnostics(test_function.module_id).unwrap_or_default();
 
-    OrderedHashMap::from([
+    TestRunnerResult::success(OrderedHashMap::from([
         ("semantic_diagnostics".into(), semantic_diagnostics),
         ("lowering".into(), writer),
         ("lowering_diagnostics".into(), lowering_diagnostics.format(db)),
-    ])
+    ]))
 }

@@ -1,20 +1,31 @@
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+#[cfg(not(feature = "alloc"))]
+use std::collections::HashMap;
+#[cfg(feature = "alloc")]
+use cairo_vm::without_std::collections::HashMap;
+
+use cairo_lang_filesystem::log_db::LogDatabase;
+
 use std::ops::{Deref, Shl};
+use std::vec::IntoIter;
 
 use ark_ff::fields::{Fp256, MontBackend, MontConfig};
 use ark_ff::{BigInteger, Field, PrimeField};
 use ark_std::UniformRand;
 use cairo_felt::{felt_str as felt252_str, Felt252};
 use cairo_lang_casm::hints::{CoreHint, DeprecatedHint, Hint, StarknetHint};
-use cairo_lang_casm::instructions::Instruction;
 use cairo_lang_casm::operand::{
     BinOpOperand, CellRef, DerefOrImmediate, Operation, Register, ResOperand,
 };
 use cairo_lang_sierra::ids::FunctionId;
+use cairo_lang_utils::bigint::BigIntAsHex;
+use cairo_lang_utils::byte_array::{BYTES_IN_WORD, BYTE_ARRAY_MAGIC};
 use cairo_lang_utils::extract_matches;
-use cairo_vm::hint_processor::hint_processor_definition::{HintProcessor, HintReference};
+use cairo_vm::hint_processor::hint_processor_definition::{
+    HintProcessor, HintProcessorLogic, HintReference,
+};
 use cairo_vm::serde::deserialize_program::{
     ApTracking, BuiltinName, FlowTrackingData, HintParams, ReferenceManager,
 };
@@ -25,21 +36,26 @@ use cairo_vm::vm::errors::cairo_run_errors::CairoRunError;
 use cairo_vm::vm::errors::hint_errors::HintError;
 use cairo_vm::vm::errors::memory_errors::MemoryError;
 use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
-use cairo_vm::vm::runners::cairo_runner::CairoRunner;
+use cairo_vm::vm::runners::cairo_runner::{
+    CairoRunner, ExecutionResources, ResourceTracker, RunResources,
+};
 use cairo_vm::vm::vm_core::VirtualMachine;
 use dict_manager::DictManagerExecScope;
-use num_bigint::BigUint;
-use num_integer::Integer;
-use num_traits::{FromPrimitive, ToPrimitive, Zero};
+use itertools::Itertools;
+use num_bigint::{BigInt, BigUint};
+use num_integer::{ExtendedGcd, Integer};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 use {ark_secp256k1 as secp256k1, ark_secp256r1 as secp256r1};
 
+use self::contract_address::calculate_contract_address;
 use self::dict_manager::DictSquashExecScope;
-use crate::short_string::as_cairo_short_string;
-use crate::{build_hints_dict, Arg, RunResultValue, SierraCasmRunner};
+use crate::short_string::{as_cairo_short_string, as_cairo_short_string_ex};
+use crate::{Arg, RunResultValue, SierraCasmRunner, StarknetExecutionResources};
 
 #[cfg(test)]
 mod test;
 
+mod contract_address;
 mod dict_manager;
 
 // TODO(orizi): This def is duplicated.
@@ -57,7 +73,7 @@ type Fq = Fp256<MontBackend<FqConfig, 4>>;
 /// Convert a Hint to the cairo-vm class HintParams by canonically serializing it to a string.
 pub fn hint_to_hint_params(hint: &Hint) -> HintParams {
     HintParams {
-        code: hint.to_string(),
+        code: hint.representing_string(),
         accessible_scopes: vec![],
         flow_tracking_data: FlowTrackingData {
             ap_tracking: ApTracking::new(),
@@ -85,15 +101,19 @@ struct Secp256r1ExecutionScope {
 /// HintProcessor for Cairo compiler hints.
 pub struct CairoHintProcessor<'a> {
     /// The Cairo runner.
-    #[allow(dead_code)]
     pub runner: Option<&'a SierraCasmRunner>,
-    // A mapping from a string that represents a hint to the hint object.
+    /// A mapping from a string that represents a hint to the hint object.
     pub string_to_hint: HashMap<String, Hint>,
-    // The starknet state.
+    /// The starknet state.
     pub starknet_state: StarknetState,
+    /// Maintains the resources of the run.
+    pub run_resources: RunResources,
+    /// Resources used during syscalls - does not include resources used during the current VM run.
+    /// At the end of the run - adding both would result in the actual expected resource usage.
+    pub syscalls_used_resources: StarknetExecutionResources,
 }
 
-fn cell_ref_to_relocatable(cell_ref: &CellRef, vm: &VirtualMachine) -> Relocatable {
+pub fn cell_ref_to_relocatable(cell_ref: &CellRef, vm: &VirtualMachine) -> Relocatable {
     let base = match cell_ref.register {
         Register::AP => vm.get_ap(),
         Register::FP => vm.get_fp(),
@@ -102,6 +122,7 @@ fn cell_ref_to_relocatable(cell_ref: &CellRef, vm: &VirtualMachine) -> Relocatab
 }
 
 /// Inserts a value into the vm memory cell represented by the cellref.
+#[macro_export]
 macro_rules! insert_value_to_cellref {
     ($vm:ident, $cell_ref:ident, $value:expr) => {
         $vm.insert_value(cell_ref_to_relocatable($cell_ref, $vm), $value)
@@ -111,6 +132,9 @@ macro_rules! insert_value_to_cellref {
 // Log type signature
 type Log = (Vec<Felt252>, Vec<Felt252>);
 
+// L2 to L1 message type signature
+type L2ToL1Message = (Felt252, Vec<Felt252>);
+
 /// Execution scope for starknet related data.
 /// All values will be 0 and by default if not setup by the test.
 #[derive(Clone, Default)]
@@ -118,10 +142,9 @@ pub struct StarknetState {
     /// The values of addresses in the simulated storage per contract.
     storage: HashMap<Felt252, HashMap<Felt252, Felt252>>,
     /// A mapping from contract address to class hash.
-    #[allow(dead_code)]
     deployed_contracts: HashMap<Felt252, Felt252>,
     /// A mapping from contract address to logs.
-    logs: HashMap<Felt252, VecDeque<Log>>,
+    logs: HashMap<Felt252, ContractLogs>,
     /// The simulated execution info.
     exec_info: ExecutionInfo,
     next_id: Felt252,
@@ -131,6 +154,36 @@ impl StarknetState {
         self.next_id += Felt252::from(1);
         self.next_id.clone()
     }
+
+    /// Replaces the addresses in the context.
+    pub fn open_caller_context(
+        &mut self,
+        (new_contract_address, new_caller_address): (Felt252, Felt252),
+    ) -> (Felt252, Felt252) {
+        let old_contract_address =
+            std::mem::replace(&mut self.exec_info.contract_address, new_contract_address);
+        let old_caller_address =
+            std::mem::replace(&mut self.exec_info.caller_address, new_caller_address);
+        (old_contract_address, old_caller_address)
+    }
+
+    /// Restores the addresses in the context.
+    pub fn close_caller_context(
+        &mut self,
+        (old_contract_address, old_caller_address): (Felt252, Felt252),
+    ) {
+        self.exec_info.contract_address = old_contract_address;
+        self.exec_info.caller_address = old_caller_address;
+    }
+}
+
+/// Object storing logs for a contract.
+#[derive(Clone, Default)]
+struct ContractLogs {
+    /// Events.
+    events: VecDeque<Log>,
+    /// Messages sent to L1.
+    l2_to_l1_messages: VecDeque<L2ToL1Message>,
 }
 
 /// Copy of the cairo `ExecutionInfo` struct.
@@ -140,6 +193,7 @@ struct ExecutionInfo {
     tx_info: TxInfo,
     caller_address: Felt252,
     contract_address: Felt252,
+    entry_point_selector: Felt252,
 }
 
 /// Copy of the cairo `BlockInfo` struct.
@@ -160,7 +214,22 @@ struct TxInfo {
     transaction_hash: Felt252,
     chain_id: Felt252,
     nonce: Felt252,
+    resource_bounds: Vec<ResourceBounds>,
+    tip: Felt252,
+    paymaster_data: Vec<Felt252>,
+    nonce_data_availability_mode: Felt252,
+    fee_data_availability_mode: Felt252,
+    account_deployment_data: Vec<Felt252>,
 }
+
+/// Copy of the cairo `ResourceBounds` struct.
+#[derive(Clone, Default)]
+struct ResourceBounds {
+    resource: Felt252,
+    max_amount: Felt252,
+    max_price_per_unit: Felt252,
+}
+
 /// Execution scope for constant memory allocation.
 struct MemoryExecScope {
     /// The first free address in the segment.
@@ -190,7 +259,7 @@ fn get_cell_maybe(
 }
 
 /// Fetches the value of a cell plus an offset from the vm, useful for pointers.
-fn get_ptr(
+pub fn get_ptr(
     vm: &VirtualMachine,
     cell: &CellRef,
     offset: &Felt252,
@@ -217,8 +286,20 @@ fn get_double_deref_maybe(
     get_maybe_from_addr(vm, get_ptr(vm, cell, offset)?)
 }
 
+/// Extracts a parameter assumed to be a buffer, and converts it into a relocatable.
+pub fn extract_relocatable(
+    vm: &VirtualMachine,
+    buffer: &ResOperand,
+) -> Result<Relocatable, VirtualMachineError> {
+    let (base, offset) = extract_buffer(buffer);
+    get_ptr(vm, base, &offset)
+}
+
 /// Fetches the value of `res_operand` from the vm.
-fn get_val(vm: &VirtualMachine, res_operand: &ResOperand) -> Result<Felt252, VirtualMachineError> {
+pub fn get_val(
+    vm: &VirtualMachine,
+    res_operand: &ResOperand,
+) -> Result<Felt252, VirtualMachineError> {
     match res_operand {
         ResOperand::Deref(cell) => get_cell_val(vm, cell),
         ResOperand::DoubleDeref(cell, offset) => get_double_deref_val(vm, cell, &(*offset).into()),
@@ -255,13 +336,52 @@ macro_rules! fail_syscall {
     };
 }
 
+/// Gas Costs for syscalls.
+/// Mostly duplication of:
+/// `https://github.com/starkware-libs/blockifier/blob/main/crates/blockifier/src/abi/constants.rs`.
+mod gas_costs {
+    const STEP: usize = 100;
+    const RANGE_CHECK: usize = 70;
+
+    /// Entry point initial gas cost enforced by the compiler.
+    /// Should match `ENTRY_POINT_COST` at `crates/cairo-lang-starknet/src/casm_contract_class.rs`.
+    const ENTRY_POINT_INITIAL_BUDGET: usize = 100 * STEP;
+    /// OS gas costs.
+    const ENTRY_POINT: usize = ENTRY_POINT_INITIAL_BUDGET + 500 * STEP;
+    // The required gas for each syscall minus the base amount that was pre-charged (by the
+    // compiler).
+    pub const CALL_CONTRACT: usize = 10 * STEP + ENTRY_POINT;
+    pub const DEPLOY: usize = 200 * STEP + ENTRY_POINT;
+    pub const EMIT_EVENT: usize = 10 * STEP;
+    pub const GET_BLOCK_HASH: usize = 50 * STEP;
+    pub const GET_EXECUTION_INFO: usize = 10 * STEP;
+    pub const KECCAK: usize = 0;
+    pub const KECCAK_ROUND_COST: usize = 180000;
+    pub const SHA256_PROCESS_BLOCK: usize = 2000 * STEP;
+    pub const LIBRARY_CALL: usize = CALL_CONTRACT;
+    pub const REPLACE_CLASS: usize = 50 * STEP;
+    pub const SECP256K1_ADD: usize = 254 * STEP + 29 * RANGE_CHECK;
+    pub const SECP256K1_GET_POINT_FROM_X: usize = 260 * STEP + 29 * RANGE_CHECK;
+    pub const SECP256K1_GET_XY: usize = 24 * STEP + 9 * RANGE_CHECK;
+    pub const SECP256K1_MUL: usize = 121810 * STEP + 10739 * RANGE_CHECK;
+    pub const SECP256K1_NEW: usize = 340 * STEP + 36 * RANGE_CHECK;
+    pub const SECP256R1_ADD: usize = 254 * STEP + 29 * RANGE_CHECK;
+    pub const SECP256R1_GET_POINT_FROM_X: usize = 260 * STEP + 29 * RANGE_CHECK;
+    pub const SECP256R1_GET_XY: usize = 24 * STEP + 9 * RANGE_CHECK;
+    pub const SECP256R1_MUL: usize = 121810 * STEP + 10739 * RANGE_CHECK;
+    pub const SECP256R1_NEW: usize = 340 * STEP + 36 * RANGE_CHECK;
+    pub const SEND_MESSAGE_TO_L1: usize = 50 * STEP;
+    pub const STORAGE_READ: usize = 50 * STEP;
+    pub const STORAGE_WRITE: usize = 50 * STEP;
+}
+
 /// Deducts gas from the given gas counter, or fails the syscall if there is not enough gas.
 macro_rules! deduct_gas {
-    ($gas:ident, $amount:expr) => {
-        if *$gas < $amount {
+    ($gas:ident, $amount:ident) => {
+        if *$gas < gas_costs::$amount {
             fail_syscall!(b"Syscall out of gas");
         }
-        *$gas -= $amount;
+        *$gas -= gas_costs::$amount;
     };
 }
 
@@ -295,7 +415,7 @@ fn get_maybe(
     }
 }
 
-impl HintProcessor for CairoHintProcessor<'_> {
+impl HintProcessorLogic for CairoHintProcessor<'_> {
     /// Trait function to execute a given hint in the hint processor.
     fn execute_hint(
         &mut self,
@@ -315,78 +435,20 @@ impl HintProcessor for CairoHintProcessor<'_> {
             StarknetHint::SystemCall { system } => {
                 self.execute_syscall(system, vm, exec_scopes)?;
             }
-            StarknetHint::SetBlockNumber { value } => {
-                self.starknet_state.exec_info.block_info.block_number = get_val(vm, value)?;
-            }
-            StarknetHint::SetSequencerAddress { value } => {
-                self.starknet_state.exec_info.block_info.sequencer_address = get_val(vm, value)?;
-            }
-            StarknetHint::SetBlockTimestamp { value } => {
-                self.starknet_state.exec_info.block_info.block_timestamp = get_val(vm, value)?;
-            }
-            StarknetHint::SetCallerAddress { value } => {
-                self.starknet_state.exec_info.caller_address = get_val(vm, value)?;
-            }
-            StarknetHint::SetContractAddress { value } => {
-                self.starknet_state.exec_info.contract_address = get_val(vm, value)?;
-            }
-            StarknetHint::SetVersion { value } => {
-                self.starknet_state.exec_info.tx_info.version = get_val(vm, value)?;
-            }
-            StarknetHint::SetAccountContractAddress { value } => {
-                self.starknet_state.exec_info.tx_info.account_contract_address =
-                    get_val(vm, value)?;
-            }
-            StarknetHint::SetMaxFee { value } => {
-                self.starknet_state.exec_info.tx_info.max_fee = get_val(vm, value)?;
-            }
-            StarknetHint::SetTransactionHash { value } => {
-                self.starknet_state.exec_info.tx_info.transaction_hash = get_val(vm, value)?;
-            }
-            StarknetHint::SetChainId { value } => {
-                self.starknet_state.exec_info.tx_info.chain_id = get_val(vm, value)?;
-            }
-            StarknetHint::SetNonce { value } => {
-                self.starknet_state.exec_info.tx_info.nonce = get_val(vm, value)?;
-            }
-            StarknetHint::SetSignature { start, end } => {
-                let (cell, offset) = extract_buffer(start);
-                let start = get_ptr(vm, cell, &offset)?;
-                let (cell, offset) = extract_buffer(end);
-                let end = get_ptr(vm, cell, &offset)?;
-                self.starknet_state.exec_info.tx_info.signature = vm_get_range(vm, start, end)?;
-            }
-            StarknetHint::PopLog {
-                value,
-                opt_variant,
-                keys_start,
-                keys_end,
-                data_start,
-                data_end,
+            StarknetHint::Cheatcode {
+                selector,
+                input_start,
+                input_end,
+                output_start,
+                output_end,
             } => {
-                let contract_address = get_val(vm, value)?;
-                let mut res_segment = MemBuffer::new_segment(vm);
-                let logs = self.starknet_state.logs.entry(contract_address).or_default();
-
-                if let Some((keys, data)) = logs.pop_front() {
-                    let keys_start_ptr = res_segment.ptr;
-                    res_segment.write_data(keys.iter())?;
-                    let keys_end_ptr = res_segment.ptr;
-
-                    let data_start_ptr = res_segment.ptr;
-                    res_segment.write_data(data.iter())?;
-                    let data_end_ptr = res_segment.ptr;
-
-                    // Option::Some variant
-                    insert_value_to_cellref!(vm, opt_variant, 0)?;
-                    insert_value_to_cellref!(vm, keys_start, keys_start_ptr)?;
-                    insert_value_to_cellref!(vm, keys_end, keys_end_ptr)?;
-                    insert_value_to_cellref!(vm, data_start, data_start_ptr)?;
-                    insert_value_to_cellref!(vm, data_end, data_end_ptr)?;
-                } else {
-                    // Option::None variant
-                    insert_value_to_cellref!(vm, opt_variant, 1)?;
-                }
+                self.execute_cheatcode(
+                    selector,
+                    [input_start, input_end],
+                    [output_start, output_end],
+                    vm,
+                    exec_scopes,
+                )?;
             }
         };
         Ok(())
@@ -398,14 +460,32 @@ impl HintProcessor for CairoHintProcessor<'_> {
         hint_code: &str,
         _ap_tracking_data: &ApTracking,
         _reference_ids: &HashMap<String, usize>,
-        _references: &HashMap<usize, HintReference>,
+        _references: &[HintReference],
     ) -> Result<Box<dyn Any>, VirtualMachineError> {
         Ok(Box::new(self.string_to_hint[hint_code].clone()))
     }
 }
 
+impl ResourceTracker for CairoHintProcessor<'_> {
+    fn consumed(&self) -> bool {
+        self.run_resources.consumed()
+    }
+
+    fn consume_step(&mut self) {
+        self.run_resources.consume_step()
+    }
+
+    fn get_n_steps(&self) -> Option<usize> {
+        self.run_resources.get_n_steps()
+    }
+
+    fn run_resources(&self) -> &RunResources {
+        self.run_resources.run_resources()
+    }
+}
+
 /// Wrapper trait for a VM owner.
-trait VMWrapper {
+pub trait VMWrapper {
     fn vm(&mut self) -> &mut VirtualMachine;
 }
 impl VMWrapper for VirtualMachine {
@@ -414,7 +494,7 @@ impl VMWrapper for VirtualMachine {
     }
 }
 
-/// Creates a new segment in the VM memory and writes data to it, returing the start and end
+/// Creates a new segment in the VM memory and writes data to it, returning the start and end
 /// pointers of the segment.
 fn segment_with_data<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
     vm: &mut dyn VMWrapper,
@@ -427,7 +507,7 @@ fn segment_with_data<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
 }
 
 /// A helper struct to continuously write and read from a buffer in the VM memory.
-struct MemBuffer<'a> {
+pub struct MemBuffer<'a> {
     /// The VM to write to.
     /// This is a trait so that we would borrow the actual VM only once.
     vm: &'a mut dyn VMWrapper,
@@ -436,12 +516,12 @@ struct MemBuffer<'a> {
 }
 impl<'a> MemBuffer<'a> {
     /// Creates a new buffer.
-    fn new(vm: &'a mut dyn VMWrapper, ptr: Relocatable) -> Self {
+    pub fn new(vm: &'a mut dyn VMWrapper, ptr: Relocatable) -> Self {
         Self { vm, ptr }
     }
 
     /// Creates a new segment and returns a buffer wrapping it.
-    fn new_segment(vm: &'a mut dyn VMWrapper) -> Self {
+    pub fn new_segment(vm: &'a mut dyn VMWrapper) -> Self {
         let ptr = vm.vm().add_memory_segment();
         Self::new(vm, ptr)
     }
@@ -456,29 +536,37 @@ impl<'a> MemBuffer<'a> {
     /// Returns the felt252 value in the current position of the buffer and advances it by one.
     /// Fails if the value is not a felt252.
     /// Borrows the buffer since a reference is returned.
-    fn next_felt252(&mut self) -> Result<Cow<'_, Felt252>, MemoryError> {
+    pub fn next_felt252(&mut self) -> Result<Cow<'_, Felt252>, MemoryError> {
         let ptr = self.next();
         self.vm.vm().get_integer(ptr)
+    }
+
+    /// Returns the bool value in the current position of the buffer and advances it by one.
+    /// Fails with `MemoryError` if the value is not a felt252.
+    /// Panics if the value is not a bool.
+    fn next_bool(&mut self) -> Result<bool, MemoryError> {
+        let ptr = self.next();
+        Ok(!(self.vm.vm().get_integer(ptr)?.is_zero()))
     }
 
     /// Returns the usize value in the current position of the buffer and advances it by one.
     /// Fails with `MemoryError` if the value is not a felt252.
     /// Panics if the value is not a usize.
-    fn next_usize(&mut self) -> Result<usize, MemoryError> {
+    pub fn next_usize(&mut self) -> Result<usize, MemoryError> {
         Ok(self.next_felt252()?.to_usize().unwrap())
     }
 
     /// Returns the u128 value in the current position of the buffer and advances it by one.
     /// Fails with `MemoryError` if the value is not a felt252.
     /// Panics if the value is not a u128.
-    fn next_u128(&mut self) -> Result<u128, MemoryError> {
+    pub fn next_u128(&mut self) -> Result<u128, MemoryError> {
         Ok(self.next_felt252()?.to_u128().unwrap())
     }
 
     /// Returns the u64 value in the current position of the buffer and advances it by one.
     /// Fails with `MemoryError` if the value is not a felt252.
     /// Panics if the value is not a u64.
-    fn next_u64(&mut self) -> Result<u64, MemoryError> {
+    pub fn next_u64(&mut self) -> Result<u64, MemoryError> {
         Ok(self.next_felt252()?.to_u64().unwrap())
     }
 
@@ -486,13 +574,13 @@ impl<'a> MemBuffer<'a> {
     /// it by two.
     /// Fails with `MemoryError` if any of the next two values are not felt252s.
     /// Panics if any of the next two values are not u128.
-    fn next_u256(&mut self) -> Result<BigUint, MemoryError> {
+    pub fn next_u256(&mut self) -> Result<BigUint, MemoryError> {
         Ok(self.next_u128()? + BigUint::from(self.next_u128()?).shl(128))
     }
 
     /// Returns the address value in the current position of the buffer and advances it by one.
     /// Fails if the value is not an address.
-    fn next_addr(&mut self) -> Result<Relocatable, MemoryError> {
+    pub fn next_addr(&mut self) -> Result<Relocatable, MemoryError> {
         let ptr = self.next();
         self.vm.vm().get_relocatable(ptr)
     }
@@ -500,20 +588,29 @@ impl<'a> MemBuffer<'a> {
     /// Returns the array of integer values pointed to by the two next addresses in the buffer and
     /// advances it by two. Will fail if the two values are not addresses or if the addresses do
     /// not point to an array of integers.
-    fn next_arr(&mut self) -> Result<Vec<Felt252>, HintError> {
+    pub fn next_arr(&mut self) -> Result<Vec<Felt252>, HintError> {
         let start = self.next_addr()?;
         let end = self.next_addr()?;
         vm_get_range(self.vm.vm(), start, end)
     }
 
+    /// Returns the array of integer values pointed to by the next address in the buffer and
+    /// with a fixed size and advances the buffer by one. Will fail if the next value is not
+    /// an address or if the address does not point to an array of integers.
+    pub fn next_fixed_size_arr_pointer(&mut self, size: usize) -> Result<Vec<Felt252>, HintError> {
+        let start = self.next_addr()?;
+        let end = (start + size)?;
+        vm_get_range(self.vm.vm(), start, end)
+    }
+
     /// Writes a value to the current position of the buffer and advances it by one.
-    fn write<T: Into<MaybeRelocatable>>(&mut self, value: T) -> Result<(), MemoryError> {
+    pub fn write<T: Into<MaybeRelocatable>>(&mut self, value: T) -> Result<(), MemoryError> {
         let ptr = self.next();
         self.vm.vm().insert_value(ptr, value)
     }
     /// Writes an iterator of values starting from the current position of the buffer and advances
     /// it to after the end of the written value.
-    fn write_data<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
+    pub fn write_data<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
         &mut self,
         data: Data,
     ) -> Result<(), MemoryError> {
@@ -525,7 +622,7 @@ impl<'a> MemBuffer<'a> {
 
     /// Writes an array into a new segment and writes the start and end pointers to the current
     /// position of the buffer. Advances the buffer by two.
-    fn write_arr<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
+    pub fn write_arr<T: Into<MaybeRelocatable>, Data: Iterator<Item = T>>(
         &mut self,
         data: Data,
     ) -> Result<(), MemoryError> {
@@ -549,8 +646,7 @@ impl<'a> CairoHintProcessor<'a> {
         vm: &mut VirtualMachine,
         exec_scopes: &mut ExecutionScopes,
     ) -> Result<(), HintError> {
-        let (cell, offset) = extract_buffer(system);
-        let system_ptr = get_ptr(vm, cell, &offset)?;
+        let system_ptr = extract_relocatable(vm, system)?;
         let mut system_buffer = MemBuffer::new(vm, system_ptr);
         let selector = system_buffer.next_felt252()?.to_bytes_be();
         let mut gas_counter = system_buffer.next_usize()?;
@@ -575,7 +671,9 @@ impl<'a> CairoHintProcessor<'a> {
                 }
                 Ok(())
             };
-        match std::str::from_utf8(&selector).unwrap() {
+        let selector = std::str::from_utf8(&selector).unwrap();
+        *self.syscalls_used_resources.syscalls.entry(selector.into()).or_default() += 1;
+        match selector {
             "StorageWrite" => execute_handle_helper(&mut |system_buffer, gas_counter| {
                 self.storage_write(
                     gas_counter,
@@ -601,13 +699,23 @@ impl<'a> CairoHintProcessor<'a> {
                 self.emit_event(gas_counter, system_buffer.next_arr()?, system_buffer.next_arr()?)
             }),
             "SendMessageToL1" => execute_handle_helper(&mut |system_buffer, gas_counter| {
-                let _to_address = system_buffer.next_felt252()?;
-                let _payload = system_buffer.next_arr()?;
-                deduct_gas!(gas_counter, 50);
-                Ok(SyscallResult::Success(vec![]))
+                self.send_message_to_l1(
+                    gas_counter,
+                    system_buffer.next_felt252()?.into_owned(),
+                    system_buffer.next_arr()?,
+                )
             }),
             "Keccak" => execute_handle_helper(&mut |system_buffer, gas_counter| {
                 keccak(gas_counter, system_buffer.next_arr()?)
+            }),
+            "SHA256ProcessBlock" => execute_handle_helper(&mut |system_buffer, gas_counter| {
+                sha_256_process_block(
+                    gas_counter,
+                    system_buffer.next_fixed_size_arr_pointer(8)?,
+                    system_buffer.next_arr()?,
+                    exec_scopes,
+                    system_buffer,
+                )
             }),
             "Secp256k1New" => execute_handle_helper(&mut |system_buffer, gas_counter| {
                 secp256k1_new(
@@ -637,7 +745,7 @@ impl<'a> CairoHintProcessor<'a> {
                 secp256k1_get_point_from_x(
                     gas_counter,
                     system_buffer.next_u256()?,
-                    system_buffer.next_felt252()?.is_zero(),
+                    system_buffer.next_bool()?,
                     exec_scopes,
                 )
             }),
@@ -672,7 +780,7 @@ impl<'a> CairoHintProcessor<'a> {
                 secp256r1_get_point_from_x(
                     gas_counter,
                     system_buffer.next_u256()?,
-                    system_buffer.next_felt252()?.is_zero(),
+                    system_buffer.next_bool()?,
                     exec_scopes,
                 )
             }),
@@ -685,7 +793,7 @@ impl<'a> CairoHintProcessor<'a> {
                     system_buffer.next_felt252()?.into_owned(),
                     system_buffer.next_felt252()?.into_owned(),
                     system_buffer.next_arr()?,
-                    system_buffer.next_felt252()?.into_owned(),
+                    system_buffer.next_bool()?,
                     system_buffer,
                 )
             }),
@@ -708,11 +816,7 @@ impl<'a> CairoHintProcessor<'a> {
                 )
             }),
             "ReplaceClass" => execute_handle_helper(&mut |system_buffer, gas_counter| {
-                self.replace_class(
-                    gas_counter,
-                    system_buffer.next_felt252()?.into_owned(),
-                    system_buffer,
-                )
+                self.replace_class(gas_counter, system_buffer.next_felt252()?.into_owned())
             }),
             _ => panic!("Unknown selector for system call!"),
         }
@@ -726,7 +830,7 @@ impl<'a> CairoHintProcessor<'a> {
         addr: Felt252,
         value: Felt252,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 1000);
+        deduct_gas!(gas_counter, STORAGE_WRITE);
         if !addr_domain.is_zero() {
             // Only address_domain 0 is currently supported.
             fail_syscall!(b"Unsupported address domain");
@@ -743,7 +847,7 @@ impl<'a> CairoHintProcessor<'a> {
         addr_domain: Felt252,
         addr: Felt252,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 100);
+        deduct_gas!(gas_counter, STORAGE_READ);
         if !addr_domain.is_zero() {
             // Only address_domain 0 is currently supported.
             fail_syscall!(b"Unsupported address domain");
@@ -764,9 +868,9 @@ impl<'a> CairoHintProcessor<'a> {
         gas_counter: &mut usize,
         _block_number: u64,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 100);
+        deduct_gas!(gas_counter, GET_BLOCK_HASH);
         // TODO(Arni, 28/5/2023): Replace the temporary return value with the required value.
-        //      One design suggestion - to preform a storage read. Have an arbitrary, hardcoded
+        //      One design suggestion - to perform a storage read. Have an arbitrary, hardcoded
         //      (For example, addr=1) contain the mapping from block number to block hash.
         fail_syscall!(b"GET_BLOCK_HASH_UNIMPLEMENTED");
     }
@@ -777,7 +881,7 @@ impl<'a> CairoHintProcessor<'a> {
         gas_counter: &mut usize,
         vm: &mut dyn VMWrapper,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
+        deduct_gas!(gas_counter, GET_EXECUTION_INFO);
         let exec_info = &self.starknet_state.exec_info;
         let block_info = &exec_info.block_info;
         let tx_info = &exec_info.tx_info;
@@ -785,6 +889,19 @@ impl<'a> CairoHintProcessor<'a> {
         let signature_start = res_segment.ptr;
         res_segment.write_data(tx_info.signature.iter().cloned())?;
         let signature_end = res_segment.ptr;
+        let resource_bounds_start = res_segment.ptr;
+        for value in &tx_info.resource_bounds {
+            res_segment.write(&value.resource)?;
+            res_segment.write(&value.max_amount)?;
+            res_segment.write(&value.max_price_per_unit)?;
+        }
+        let resource_bounds_end = res_segment.ptr;
+        let paymaster_data_start = res_segment.ptr;
+        res_segment.write_data(tx_info.paymaster_data.iter().cloned())?;
+        let paymaster_data_end = res_segment.ptr;
+        let account_deployment_data_start = res_segment.ptr;
+        res_segment.write_data(tx_info.account_deployment_data.iter().cloned())?;
+        let account_deployment_data_end = res_segment.ptr;
         let tx_info_ptr = res_segment.ptr;
         res_segment.write(tx_info.version.clone())?;
         res_segment.write(tx_info.account_contract_address.clone())?;
@@ -794,6 +911,15 @@ impl<'a> CairoHintProcessor<'a> {
         res_segment.write(tx_info.transaction_hash.clone())?;
         res_segment.write(tx_info.chain_id.clone())?;
         res_segment.write(tx_info.nonce.clone())?;
+        res_segment.write(resource_bounds_start)?;
+        res_segment.write(resource_bounds_end)?;
+        res_segment.write(tx_info.tip.clone())?;
+        res_segment.write(paymaster_data_start)?;
+        res_segment.write(paymaster_data_end)?;
+        res_segment.write(tx_info.nonce_data_availability_mode.clone())?;
+        res_segment.write(tx_info.fee_data_availability_mode.clone())?;
+        res_segment.write(account_deployment_data_start)?;
+        res_segment.write(account_deployment_data_end)?;
         let block_info_ptr = res_segment.ptr;
         res_segment.write(block_info.block_number.clone())?;
         res_segment.write(block_info.block_timestamp.clone())?;
@@ -803,6 +929,7 @@ impl<'a> CairoHintProcessor<'a> {
         res_segment.write(tx_info_ptr)?;
         res_segment.write(exec_info.caller_address.clone())?;
         res_segment.write(exec_info.contract_address.clone())?;
+        res_segment.write(exec_info.entry_point_selector.clone())?;
         Ok(SyscallResult::Success(vec![exec_info_ptr.into()]))
     }
 
@@ -813,9 +940,27 @@ impl<'a> CairoHintProcessor<'a> {
         keys: Vec<Felt252>,
         data: Vec<Felt252>,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
+        deduct_gas!(gas_counter, EMIT_EVENT);
         let contract = self.starknet_state.exec_info.contract_address.clone();
-        self.starknet_state.logs.entry(contract).or_default().push_front((keys, data));
+        self.starknet_state.logs.entry(contract).or_default().events.push_back((keys, data));
+        Ok(SyscallResult::Success(vec![]))
+    }
+
+    /// Executes the `send_message_to_l1_event_syscall` syscall.
+    fn send_message_to_l1(
+        &mut self,
+        gas_counter: &mut usize,
+        to_address: Felt252,
+        payload: Vec<Felt252>,
+    ) -> Result<SyscallResult, HintError> {
+        deduct_gas!(gas_counter, SEND_MESSAGE_TO_L1);
+        let contract = self.starknet_state.exec_info.contract_address.clone();
+        self.starknet_state
+            .logs
+            .entry(contract)
+            .or_default()
+            .l2_to_l1_messages
+            .push_back((to_address, payload));
         Ok(SyscallResult::Success(vec![]))
     }
 
@@ -826,13 +971,23 @@ impl<'a> CairoHintProcessor<'a> {
         class_hash: Felt252,
         _contract_address_salt: Felt252,
         calldata: Vec<Felt252>,
-        _deploy_from_zero: Felt252,
+        deploy_from_zero: bool,
         vm: &mut dyn VMWrapper,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
+        deduct_gas!(gas_counter, DEPLOY);
 
-        // Assign an arbitrary address to the contract.
-        let deployed_contract_address = self.starknet_state.get_next_id();
+        // Assign the starknet address of the contract.
+        let deployer_address = if deploy_from_zero {
+            Felt252::zero()
+        } else {
+            self.starknet_state.exec_info.contract_address.clone()
+        };
+        let deployed_contract_address = calculate_contract_address(
+            &_contract_address_salt,
+            &class_hash,
+            &calldata,
+            &deployer_address,
+        );
 
         // Prepare runner for running the constructor.
         let runner = self.runner.expect("Runner is needed for starknet.");
@@ -840,33 +995,35 @@ impl<'a> CairoHintProcessor<'a> {
             fail_syscall!(b"CLASS_HASH_NOT_FOUND");
         };
 
-        // Call constructor if it exists.
-        let (res_data_start, res_data_end) = if let Some(constructor) = &contract_info.constructor {
-            // Replace the contract address in the context.
-            let old_contract_address = std::mem::replace(
-                &mut self.starknet_state.exec_info.contract_address,
-                deployed_contract_address.clone(),
-            );
-
-            // Run the constructor.
-            let res = self.call_entry_point(gas_counter, runner, constructor, calldata, vm);
-
-            // Restore the contract address in the context.
-            self.starknet_state.exec_info.contract_address = old_contract_address;
-            match res {
-                Ok(value) => value,
-                Err(mut revert_reason) => {
-                    fail_syscall!(revert_reason, b"CONSTRUCTOR_FAILED");
-                }
-            }
-        } else {
-            (Relocatable::from((0, 0)), Relocatable::from((0, 0)))
-        };
-
-        // Set the class hash of the deployed contract.
+        // Set the class hash of the deployed contract before executing the constructor,
+        // as the constructor could make an external call to this address.
         self.starknet_state
             .deployed_contracts
             .insert(deployed_contract_address.clone(), class_hash);
+
+        // Call constructor if it exists.
+        let (res_data_start, res_data_end) = if let Some(constructor) = &contract_info.constructor {
+            let old_addrs = self
+                .starknet_state
+                .open_caller_context((deployed_contract_address.clone(), deployer_address));
+            let res = self.call_entry_point(gas_counter, runner, constructor, calldata, vm);
+            self.starknet_state.close_caller_context(old_addrs);
+            match res {
+                Ok(value) => value,
+                Err(mut revert_reason) => {
+                    self.starknet_state.deployed_contracts.remove(&deployed_contract_address);
+                    fail_syscall!(revert_reason, b"CONSTRUCTOR_FAILED");
+                }
+            }
+        } else if calldata.is_empty() {
+            (Relocatable::from((0, 0)), Relocatable::from((0, 0)))
+        } else {
+            // Remove the contract from the deployed contracts,
+            // since it failed to deploy.
+            self.starknet_state.deployed_contracts.remove(&deployed_contract_address);
+            fail_syscall!(b"INVALID_CALLDATA_LEN");
+        };
+
         Ok(SyscallResult::Success(vec![
             deployed_contract_address.into(),
             res_data_start.into(),
@@ -883,7 +1040,7 @@ impl<'a> CairoHintProcessor<'a> {
         calldata: Vec<Felt252>,
         vm: &mut dyn VMWrapper,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
+        deduct_gas!(gas_counter, CALL_CONTRACT);
 
         // Get the class hash of the contract.
         let Some(class_hash) = self.starknet_state.deployed_contracts.get(&contract_address) else {
@@ -902,21 +1059,12 @@ impl<'a> CairoHintProcessor<'a> {
             fail_syscall!(b"ENTRYPOINT_NOT_FOUND");
         };
 
-        // Replace the contract address in the context.
-        let old_contract_address = std::mem::replace(
-            &mut self.starknet_state.exec_info.contract_address,
+        let old_addrs = self.starknet_state.open_caller_context((
             contract_address.clone(),
-        );
-        let old_caller_address = std::mem::replace(
-            &mut self.starknet_state.exec_info.caller_address,
-            old_contract_address.clone(),
-        );
-
+            self.starknet_state.exec_info.contract_address.clone(),
+        ));
         let res = self.call_entry_point(gas_counter, runner, entry_point, calldata, vm);
-
-        // Restore the contract address in the context.
-        self.starknet_state.exec_info.caller_address = old_caller_address;
-        self.starknet_state.exec_info.contract_address = old_contract_address;
+        self.starknet_state.close_caller_context(old_addrs);
 
         match res {
             Ok((res_data_start, res_data_end)) => {
@@ -937,13 +1085,12 @@ impl<'a> CairoHintProcessor<'a> {
         calldata: Vec<Felt252>,
         vm: &mut dyn VMWrapper,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
+        deduct_gas!(gas_counter, LIBRARY_CALL);
         // Prepare runner for running the call.
         let runner = self.runner.expect("Runner is needed for starknet.");
-        let contract_info = runner
-            .starknet_contracts_info
-            .get(&class_hash)
-            .expect("Deployed contract not found in registry.");
+        let Some(contract_info) = runner.starknet_contracts_info.get(&class_hash) else {
+            fail_syscall!(b"CLASS_HASH_NOT_DECLARED")
+        };
 
         // Call the function.
         let Some(entry_point) = contract_info.externals.get(&selector) else {
@@ -964,10 +1111,17 @@ impl<'a> CairoHintProcessor<'a> {
         &mut self,
         gas_counter: &mut usize,
         new_class: Felt252,
-        _vm: &mut dyn VMWrapper,
     ) -> Result<SyscallResult, HintError> {
-        deduct_gas!(gas_counter, 50);
-        // Prepare runner for running the call.
+        deduct_gas!(gas_counter, REPLACE_CLASS);
+        // Validating the class hash was declared as one of the starknet contracts.
+        if !self
+            .runner
+            .expect("Runner is needed for starknet.")
+            .starknet_contracts_info
+            .contains_key(&new_class)
+        {
+            fail_syscall!(b"CLASS_HASH_NOT_FOUND");
+        };
         let address = self.starknet_state.exec_info.contract_address.clone();
         self.starknet_state.deployed_contracts.insert(address, new_class);
         Ok(SyscallResult::Success(vec![]))
@@ -989,32 +1143,137 @@ impl<'a> CairoHintProcessor<'a> {
         let mut res = runner
             .run_function_with_starknet_context(
                 function,
-                &[Arg::Array(calldata)],
+                &[Arg::Array(calldata.into_iter().map(Arg::Value).collect())],
                 Some(*gas_counter),
                 self.starknet_state.clone(),
             )
             .expect("Internal runner error.");
-
+        self.syscalls_used_resources += res.used_resources;
         *gas_counter = res.gas_counter.unwrap().to_usize().unwrap();
-        self.starknet_state = std::mem::take(&mut res.starknet_state);
         match res.value {
             RunResultValue::Success(value) => {
+                self.starknet_state = std::mem::take(&mut res.starknet_state);
                 Ok(segment_with_data(vm, read_array_result_as_vec(&res.memory, &value).into_iter())
                     .expect("failed to allocate segment"))
             }
             RunResultValue::Panic(panic_data) => Err(panic_data),
         }
     }
+
+    /// Executes a cheatcode.
+    fn execute_cheatcode(
+        &mut self,
+        selector: &BigIntAsHex,
+        [input_start, input_end]: [&ResOperand; 2],
+        [output_start, output_end]: [&CellRef; 2],
+        vm: &mut VirtualMachine,
+        _exec_scopes: &mut ExecutionScopes,
+    ) -> Result<(), HintError> {
+        // Parse the selector.
+        let selector = &selector.value.to_bytes_be().1;
+        let selector = std::str::from_utf8(selector).map_err(|_| {
+            HintError::CustomHint(Box::from("failed to parse selector".to_string()))
+        })?;
+
+        // Extract the inputs.
+        let input_start = extract_relocatable(vm, input_start)?;
+        let input_end = extract_relocatable(vm, input_end)?;
+        let inputs = vm_get_range(vm, input_start, input_end)?;
+
+        // Helper for all the instances requiring only a single input.
+        let as_single_input = |inputs: Vec<Felt252>| {
+            if inputs.len() != 1 {
+                Err(HintError::CustomHint(Box::from(format!(
+                    "`{selector}` cheatcode invalid args: pass span of an array with exactly one \
+                     element",
+                ))))
+            } else {
+                Ok(inputs[0].clone())
+            }
+        };
+
+        let mut res_segment = MemBuffer::new_segment(vm);
+        let res_segment_start = res_segment.ptr;
+        match selector {
+            "set_sequencer_address" => {
+                self.starknet_state.exec_info.block_info.sequencer_address =
+                    as_single_input(inputs)?;
+            }
+            "set_block_number" => {
+                self.starknet_state.exec_info.block_info.block_number = as_single_input(inputs)?;
+            }
+            "set_block_timestamp" => {
+                self.starknet_state.exec_info.block_info.block_timestamp = as_single_input(inputs)?;
+            }
+            "set_caller_address" => {
+                self.starknet_state.exec_info.caller_address = as_single_input(inputs)?;
+            }
+            "set_contract_address" => {
+                self.starknet_state.exec_info.contract_address = as_single_input(inputs)?;
+            }
+            "set_version" => {
+                self.starknet_state.exec_info.tx_info.version = as_single_input(inputs)?;
+            }
+            "set_account_contract_address" => {
+                self.starknet_state.exec_info.tx_info.account_contract_address =
+                    as_single_input(inputs)?;
+            }
+            "set_max_fee" => {
+                self.starknet_state.exec_info.tx_info.max_fee = as_single_input(inputs)?;
+            }
+            "set_transaction_hash" => {
+                self.starknet_state.exec_info.tx_info.transaction_hash = as_single_input(inputs)?;
+            }
+            "set_chain_id" => {
+                self.starknet_state.exec_info.tx_info.chain_id = as_single_input(inputs)?;
+            }
+            "set_nonce" => {
+                self.starknet_state.exec_info.tx_info.nonce = as_single_input(inputs)?;
+            }
+            "set_signature" => {
+                self.starknet_state.exec_info.tx_info.signature = inputs;
+            }
+            "pop_log" => {
+                let contract_logs = self.starknet_state.logs.get_mut(&as_single_input(inputs)?);
+                if let Some((keys, data)) =
+                    contract_logs.and_then(|contract_logs| contract_logs.events.pop_front())
+                {
+                    res_segment.write(keys.len())?;
+                    res_segment.write_data(keys.iter())?;
+                    res_segment.write(data.len())?;
+                    res_segment.write_data(data.iter())?;
+                }
+            }
+            "pop_l2_to_l1_message" => {
+                let contract_logs = self.starknet_state.logs.get_mut(&as_single_input(inputs)?);
+                if let Some((to_address, payload)) = contract_logs
+                    .and_then(|contract_logs| contract_logs.l2_to_l1_messages.pop_front())
+                {
+                    res_segment.write(to_address)?;
+                    res_segment.write(payload.len())?;
+                    res_segment.write_data(payload.iter())?;
+                }
+            }
+            _ => Err(HintError::CustomHint(Box::from(format!(
+                "Unknown cheatcode selector: {selector}"
+            ))))?,
+        }
+        let res_segment_end = res_segment.ptr;
+        insert_value_to_cellref!(vm, output_start, res_segment_start)?;
+        insert_value_to_cellref!(vm, output_end, res_segment_end)?;
+        Ok(())
+    }
 }
 
 /// Executes the `keccak_syscall` syscall.
 fn keccak(gas_counter: &mut usize, data: Vec<Felt252>) -> Result<SyscallResult, HintError> {
+    deduct_gas!(gas_counter, KECCAK);
     if data.len() % 17 != 0 {
         fail_syscall!(b"Invalid keccak input size");
     }
     let mut state = [0u64; 25];
     for chunk in data.chunks(17) {
-        deduct_gas!(gas_counter, 5000);
+        deduct_gas!(gas_counter, KECCAK_ROUND_COST);
         for (i, val) in chunk.iter().enumerate() {
             state[i] ^= val.to_u64().unwrap();
         }
@@ -1026,6 +1285,36 @@ fn keccak(gas_counter: &mut usize, data: Vec<Felt252>) -> Result<SyscallResult, 
     ]))
 }
 
+/// Executes the `sha256_process_block` syscall.
+fn sha_256_process_block(
+    gas_counter: &mut usize,
+    prev_state: Vec<Felt252>,
+    data: Vec<Felt252>,
+    exec_scopes: &mut ExecutionScopes,
+    vm: &mut dyn VMWrapper,
+) -> Result<SyscallResult, HintError> {
+    deduct_gas!(gas_counter, SHA256_PROCESS_BLOCK);
+    if data.len() != 16 {
+        fail_syscall!(b"Invalid sha256_chunk input size");
+    }
+
+    let data_as_bytes = sha2::digest::generic_array::GenericArray::from_exact_iter(
+        data.iter().flat_map(|felt| felt.to_bigint().to_u32().unwrap().to_be_bytes()),
+    )
+    .unwrap();
+    let mut state_as_words: [u32; 8] = prev_state
+        .iter()
+        .map(|felt| felt.to_bigint().to_u32().unwrap())
+        .collect_vec()
+        .try_into()
+        .unwrap();
+    sha2::compress256(&mut state_as_words, &[data_as_bytes]);
+    let next_state_ptr = alloc_memory(exec_scopes, vm.vm(), 8)?;
+    let mut buff: MemBuffer<'_> = MemBuffer::new(vm, next_state_ptr);
+    buff.write_data(state_as_words.into_iter().map(Felt252::from))?;
+    Ok(SyscallResult::Success(vec![next_state_ptr.into()]))
+}
+
 // --- secp256k1 ---
 
 /// Executes the `secp256k1_new_syscall` syscall.
@@ -1035,9 +1324,9 @@ fn secp256k1_new(
     y: BigUint,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
-    let modulos = <secp256k1::Fq as PrimeField>::MODULUS.into();
-    if x >= modulos || y >= modulos {
+    deduct_gas!(gas_counter, SECP256K1_NEW);
+    let modulus = <secp256k1::Fq as PrimeField>::MODULUS.into();
+    if x >= modulus || y >= modulus {
         fail_syscall!(b"Coordinates out of range");
     }
     let p = if x.is_zero() && y.is_zero() {
@@ -1064,7 +1353,7 @@ fn secp256k1_add(
     p0_id: usize,
     p1_id: usize,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256K1_ADD);
     let ec = get_secp256k1_exec_scope(exec_scopes)?;
     let p0 = &ec.ec_points[p0_id];
     let p1 = &ec.ec_points[p1_id];
@@ -1078,16 +1367,14 @@ fn secp256k1_add(
 fn secp256k1_mul(
     gas_counter: &mut usize,
     p_id: usize,
-    m: BigUint,
+    scalar: BigUint,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
-    if m >= <secp256k1::Fr as PrimeField>::MODULUS.into() {
-        fail_syscall!(b"Scalar out of range");
-    }
+    deduct_gas!(gas_counter, SECP256K1_MUL);
+
     let ec = get_secp256k1_exec_scope(exec_scopes)?;
     let p = &ec.ec_points[p_id];
-    let product = *p * secp256k1::Fr::from(m);
+    let product = *p * secp256k1::Fr::from(scalar);
     let id = ec.ec_points.len();
     ec.ec_points.push(product.into());
     Ok(SyscallResult::Success(vec![id.into()]))
@@ -1100,16 +1387,17 @@ fn secp256k1_get_point_from_x(
     y_parity: bool,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256K1_GET_POINT_FROM_X);
     if x >= <secp256k1::Fq as PrimeField>::MODULUS.into() {
         fail_syscall!(b"Coordinates out of range");
     }
     let x = x.into();
     let maybe_p = secp256k1::Affine::get_ys_from_x_unchecked(x)
-        .map(|(smaller, greater)| match (smaller.0.is_even(), y_parity) {
-            (true, true) | (false, false) => smaller,
-            (true, false) | (false, true) => greater,
-        })
+        .map(
+            |(smaller, greater)|
+            // Return the correct y coordinate based on the parity.
+            if smaller.into_bigint().is_odd() == y_parity { smaller } else { greater },
+        )
         .map(|y| secp256k1::Affine::new_unchecked(x, y))
         .filter(|p| p.is_in_correct_subgroup_assuming_on_curve());
     let Some(p) = maybe_p else {
@@ -1127,7 +1415,7 @@ fn secp256k1_get_xy(
     p_id: usize,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256K1_GET_XY);
     let ec = get_secp256k1_exec_scope(exec_scopes)?;
     let p = &ec.ec_points[p_id];
     let pow_2_128 = BigUint::from(u128::MAX) + 1u32;
@@ -1163,9 +1451,9 @@ fn secp256r1_new(
     y: BigUint,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
-    let modulos = <secp256r1::Fq as PrimeField>::MODULUS.into();
-    if x >= modulos || y >= modulos {
+    deduct_gas!(gas_counter, SECP256R1_GET_POINT_FROM_X);
+    let modulus = <secp256r1::Fq as PrimeField>::MODULUS.into();
+    if x >= modulus || y >= modulus {
         fail_syscall!(b"Coordinates out of range");
     }
     let p = if x.is_zero() && y.is_zero() {
@@ -1192,7 +1480,7 @@ fn secp256r1_add(
     p0_id: usize,
     p1_id: usize,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256R1_ADD);
     let ec = get_secp256r1_exec_scope(exec_scopes)?;
     let p0 = &ec.ec_points[p0_id];
     let p1 = &ec.ec_points[p1_id];
@@ -1206,16 +1494,14 @@ fn secp256r1_add(
 fn secp256r1_mul(
     gas_counter: &mut usize,
     p_id: usize,
-    m: BigUint,
+    scalar: BigUint,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
-    if m >= <secp256r1::Fr as PrimeField>::MODULUS.into() {
-        fail_syscall!(b"Scalar out of range");
-    }
+    deduct_gas!(gas_counter, SECP256R1_MUL);
+
     let ec = get_secp256r1_exec_scope(exec_scopes)?;
     let p = &ec.ec_points[p_id];
-    let product = *p * secp256r1::Fr::from(m);
+    let product = *p * secp256r1::Fr::from(scalar);
     let id = ec.ec_points.len();
     ec.ec_points.push(product.into());
     Ok(SyscallResult::Success(vec![id.into()]))
@@ -1228,16 +1514,17 @@ fn secp256r1_get_point_from_x(
     y_parity: bool,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256R1_NEW);
     if x >= <secp256r1::Fq as PrimeField>::MODULUS.into() {
         fail_syscall!(b"Coordinates out of range");
     }
     let x = x.into();
     let maybe_p = secp256r1::Affine::get_ys_from_x_unchecked(x)
-        .map(|(smaller, greater)| match (smaller.0.is_even(), y_parity) {
-            (true, true) | (false, false) => smaller,
-            (true, false) | (false, true) => greater,
-        })
+        .map(
+            |(smaller, greater)|
+            // Return the correct y coordinate based on the parity.
+            if smaller.into_bigint().is_odd() == y_parity { smaller } else { greater },
+        )
         .map(|y| secp256r1::Affine::new_unchecked(x, y))
         .filter(|p| p.is_in_correct_subgroup_assuming_on_curve());
     let Some(p) = maybe_p else {
@@ -1255,7 +1542,7 @@ fn secp256r1_get_xy(
     p_id: usize,
     exec_scopes: &mut ExecutionScopes,
 ) -> Result<SyscallResult, HintError> {
-    deduct_gas!(gas_counter, 500);
+    deduct_gas!(gas_counter, SECP256R1_GET_XY);
     let ec = get_secp256r1_exec_scope(exec_scopes)?;
     let p = &ec.ec_points[p_id];
     let pow_2_128 = BigUint::from(u128::MAX) + 1u32;
@@ -1306,8 +1593,7 @@ pub fn execute_deprecated_hint(
 ) -> Result<(), HintError> {
     match deprecated_hint {
         DeprecatedHint::Felt252DictRead { dict_ptr, key, value_dst } => {
-            let (dict_base, dict_offset) = extract_buffer(dict_ptr);
-            let dict_address = get_ptr(vm, dict_base, &dict_offset)?;
+            let dict_address = extract_relocatable(vm, dict_ptr)?;
             let key = get_val(vm, key)?;
             let dict_manager_exec_scope = exec_scopes
                 .get_mut_ref::<DictManagerExecScope>("dict_manager_exec_scope")
@@ -1318,8 +1604,7 @@ pub fn execute_deprecated_hint(
             insert_value_to_cellref!(vm, value_dst, value)?;
         }
         DeprecatedHint::Felt252DictWrite { dict_ptr, key, value } => {
-            let (dict_base, dict_offset) = extract_buffer(dict_ptr);
-            let dict_address = get_ptr(vm, dict_base, &dict_offset)?;
+            let dict_address = extract_relocatable(vm, dict_ptr)?;
             let key = get_val(vm, key)?;
             let value = get_maybe(vm, value)?;
             let dict_manager_exec_scope = exec_scopes
@@ -1338,6 +1623,25 @@ pub fn execute_deprecated_hint(
         | DeprecatedHint::AssertLtAssertValidInput { .. } => {}
     }
     Ok(())
+}
+
+/// Allocates a memory buffer of size `size` on a vm segment.
+/// Segment will be reused between calls.
+fn alloc_memory(
+    exec_scopes: &mut ExecutionScopes,
+    vm: &mut VirtualMachine,
+    size: usize,
+) -> Result<Relocatable, HintError> {
+    const NAME: &str = "memory_exec_scope";
+    if exec_scopes.get_ref::<MemoryExecScope>(NAME).is_err() {
+        exec_scopes.assign_or_update_variable(
+            NAME,
+            Box::new(MemoryExecScope { next_address: vm.add_memory_segment() }),
+        );
+    }
+    let scope = exec_scopes.get_mut_ref::<MemoryExecScope>(NAME)?;
+    let updated = (scope.next_address + size)?;
+    Ok(std::mem::replace(&mut scope.next_address, updated))
 }
 
 /// Executes a core hint.
@@ -1525,8 +1829,7 @@ pub fn execute_core_hint(
             })?;
         }
         CoreHint::AllocFelt252Dict { segment_arena_ptr } => {
-            let (cell, base_offset) = extract_buffer(segment_arena_ptr);
-            let dict_manager_address = get_ptr(vm, cell, &base_offset)?;
+            let dict_manager_address = extract_relocatable(vm, segment_arena_ptr)?;
             let n_dicts = vm
                 .get_integer((dict_manager_address - 2)?)?
                 .into_owned()
@@ -1550,8 +1853,7 @@ pub fn execute_core_hint(
             vm.insert_value((dict_infos_base + 3 * n_dicts)?, new_dict_segment)?;
         }
         CoreHint::Felt252DictEntryInit { dict_ptr, key } => {
-            let (dict_base, dict_offset) = extract_buffer(dict_ptr);
-            let dict_address = get_ptr(vm, dict_base, &dict_offset)?;
+            let dict_address = extract_relocatable(vm, dict_ptr)?;
             let key = get_val(vm, key)?;
             let dict_manager_exec_scope = exec_scopes
                 .get_mut_ref::<DictManagerExecScope>("dict_manager_exec_scope")
@@ -1572,8 +1874,7 @@ pub fn execute_core_hint(
             dict_manager_exec_scope.insert_to_tracker(dict_address, key, value);
         }
         CoreHint::GetSegmentArenaIndex { dict_end_ptr, dict_index, .. } => {
-            let (dict_base, dict_offset) = extract_buffer(dict_end_ptr);
-            let dict_address = get_ptr(vm, dict_base, &dict_offset)?;
+            let dict_address = extract_relocatable(vm, dict_end_ptr)?;
             let dict_manager_exec_scope = exec_scopes
                 .get_ref::<DictManagerExecScope>("dict_manager_exec_scope")
                 .expect("Trying to read from a dict while dict manager was not initialized.");
@@ -1590,8 +1891,7 @@ pub fn execute_core_hint(
             );
             let dict_squash_exec_scope =
                 exec_scopes.get_mut_ref::<DictSquashExecScope>("dict_squash_exec_scope")?;
-            let (dict_accesses_base, dict_accesses_offset) = extract_buffer(dict_accesses);
-            let dict_accesses_address = get_ptr(vm, dict_accesses_base, &dict_accesses_offset)?;
+            let dict_accesses_address = extract_relocatable(vm, dict_accesses)?;
             let n_accesses = get_val(vm, n_accesses)?
                 .to_usize()
                 .expect("Number of accesses is too large or negative.");
@@ -1627,8 +1927,7 @@ pub fn execute_core_hint(
         CoreHint::GetCurrentAccessIndex { range_check_ptr } => {
             let dict_squash_exec_scope: &mut DictSquashExecScope =
                 exec_scopes.get_mut_ref("dict_squash_exec_scope")?;
-            let (range_check_base, range_check_offset) = extract_buffer(range_check_ptr);
-            let range_check_ptr = get_ptr(vm, range_check_base, &range_check_offset)?;
+            let range_check_ptr = extract_relocatable(vm, range_check_ptr)?;
             let current_access_index = dict_squash_exec_scope.current_access_index().unwrap();
             vm.insert_value(range_check_ptr, current_access_index)?;
         }
@@ -1681,11 +1980,8 @@ pub fn execute_core_hint(
         CoreHint::AssertLeFindSmallArcs { a, b, range_check_ptr } => {
             let a_val = get_val(vm, a)?;
             let b_val = get_val(vm, b)?;
-            let mut lengths_and_indices = vec![
-                (a_val.clone(), 0),
-                (b_val.clone() - a_val, 1),
-                (Felt252::from(-1) - b_val, 2),
-            ];
+            let mut lengths_and_indices =
+                [(a_val.clone(), 0), (b_val.clone() - a_val, 1), (Felt252::from(-1) - b_val, 2)];
             lengths_and_indices.sort();
             exec_scopes
                 .assign_or_update_variable("excluded_arc", Box::new(lengths_and_indices[2].1));
@@ -1693,8 +1989,7 @@ pub fn execute_core_hint(
             let prime_over_3_high = 3544607988759775765608368578435044694_u128;
             // ceil((PRIME / 2) / 2 ** 128).
             let prime_over_2_high = 5316911983139663648412552867652567041_u128;
-            let (range_check_base, range_check_offset) = extract_buffer(range_check_ptr);
-            let range_check_ptr = get_ptr(vm, range_check_base, &range_check_offset)?;
+            let range_check_ptr = extract_relocatable(vm, range_check_ptr)?;
             vm.insert_value(
                 range_check_ptr,
                 Felt252::from(lengths_and_indices[0].0.to_biguint() % prime_over_3_high),
@@ -1729,41 +2024,95 @@ pub fn execute_core_hint(
             )?;
         }
         CoreHint::DebugPrint { start, end } => {
-            let as_relocatable = |vm, value| {
-                let (base, offset) = extract_buffer(value);
-                get_ptr(vm, base, &offset)
-            };
-            let mut curr = as_relocatable(vm, start)?;
-            let end = as_relocatable(vm, end)?;
-            while curr != end {
-                let value = vm.get_integer(curr)?;
-                if let Some(shortstring) = as_cairo_short_string(&value) {
-                    println!("[DEBUG]\t{shortstring: <31}\t(raw: {:#x}", value.to_bigint());
-                } else {
-                    println!("[DEBUG]\t{:<31}\t(raw: {:#x} ", ' ', value.to_bigint());
-                }
-                curr += 1;
-            }
-            println!();
+            let mut debug_string = format_for_debug(read_felts(vm, start, end)?.into_iter()); // initialize debug_string
+            print!("{}", debug_string);
+			// write to log file
+            debug_string.push_str(&format!("\n"));
+            LogDatabase::append_file_text( "log_file".to_string(), debug_string);
+
         }
         CoreHint::AllocConstantSize { size, dst } => {
             let object_size = get_val(vm, size)?.to_usize().expect("Object size too large.");
-            let memory_exec_scope =
-                match exec_scopes.get_mut_ref::<MemoryExecScope>("memory_exec_scope") {
-                    Ok(memory_exec_scope) => memory_exec_scope,
-                    Err(_) => {
-                        exec_scopes.assign_or_update_variable(
-                            "memory_exec_scope",
-                            Box::new(MemoryExecScope { next_address: vm.add_memory_segment() }),
-                        );
-                        exec_scopes.get_mut_ref::<MemoryExecScope>("memory_exec_scope")?
-                    }
-                };
-            insert_value_to_cellref!(vm, dst, memory_exec_scope.next_address)?;
-            memory_exec_scope.next_address.offset += object_size;
+            let ptr = alloc_memory(exec_scopes, vm, object_size)?;
+            insert_value_to_cellref!(vm, dst, ptr)?;
+        }
+        CoreHint::U256InvModN {
+            b0,
+            b1,
+            n0,
+            n1,
+            g0_or_no_inv,
+            g1_option,
+            s_or_r0,
+            s_or_r1,
+            t_or_k0,
+            t_or_k1,
+        } => {
+            let pow_2_128 = BigInt::from(u128::MAX) + 1u32;
+            let b0 = get_val(vm, b0)?.to_bigint();
+            let b1 = get_val(vm, b1)?.to_bigint();
+            let n0 = get_val(vm, n0)?.to_bigint();
+            let n1 = get_val(vm, n1)?.to_bigint();
+            let b: BigInt = b0.clone() + b1.clone().shl(128);
+            let n: BigInt = n0 + n1.shl(128);
+            let ExtendedGcd { gcd: mut g, x: _, y: mut r } = n.extended_gcd(&b);
+            if n == 1.into() {
+                insert_value_to_cellref!(vm, s_or_r0, Felt252::from(b0))?;
+                insert_value_to_cellref!(vm, s_or_r1, Felt252::from(b1))?;
+                insert_value_to_cellref!(vm, t_or_k0, Felt252::from(1))?;
+                insert_value_to_cellref!(vm, t_or_k1, Felt252::from(0))?;
+                insert_value_to_cellref!(vm, g0_or_no_inv, Felt252::from(1))?;
+                insert_value_to_cellref!(vm, g1_option, Felt252::from(0))?;
+            } else if g != 1.into() {
+                // This makes sure `g0_or_no_inv` is always non-zero in the no inverse case.
+                if g.is_even() {
+                    g = 2u32.into();
+                }
+                let (limb1, limb0) = (&b / &g).div_rem(&pow_2_128);
+                insert_value_to_cellref!(vm, s_or_r0, Felt252::from(limb0))?;
+                insert_value_to_cellref!(vm, s_or_r1, Felt252::from(limb1))?;
+                let (limb1, limb0) = (&n / &g).div_rem(&pow_2_128);
+                insert_value_to_cellref!(vm, t_or_k0, Felt252::from(limb0))?;
+                insert_value_to_cellref!(vm, t_or_k1, Felt252::from(limb1))?;
+                let (limb1, limb0) = g.div_rem(&pow_2_128);
+                insert_value_to_cellref!(vm, g0_or_no_inv, Felt252::from(limb0))?;
+                insert_value_to_cellref!(vm, g1_option, Felt252::from(limb1))?;
+            } else {
+                r %= &n;
+                if r.is_negative() {
+                    r += &n;
+                }
+                let k: BigInt = (&r * b - 1) / n;
+                let (limb1, limb0) = r.div_rem(&pow_2_128);
+                insert_value_to_cellref!(vm, s_or_r0, Felt252::from(limb0))?;
+                insert_value_to_cellref!(vm, s_or_r1, Felt252::from(limb1))?;
+                let (limb1, limb0) = k.div_rem(&pow_2_128);
+                insert_value_to_cellref!(vm, t_or_k0, Felt252::from(limb0))?;
+                insert_value_to_cellref!(vm, t_or_k1, Felt252::from(limb1))?;
+                insert_value_to_cellref!(vm, g0_or_no_inv, Felt252::from(0))?;
+            }
         }
     };
     Ok(())
+}
+
+/// Reads a range of `Felt252`s from the VM.
+fn read_felts(
+    vm: &mut VirtualMachine,
+    start: &ResOperand,
+    end: &ResOperand,
+) -> Result<Vec<Felt252>, HintError> {
+    let mut curr = extract_relocatable(vm, start)?;
+    let end = extract_relocatable(vm, end)?;
+
+    let mut felts = Vec::new();
+    while curr != end {
+        let value = vm.get_integer(curr)?.deref().clone();
+        felts.push(value);
+        curr = (curr + 1)?;
+    }
+
+    Ok(felts)
 }
 
 /// Reads the result of a function call that returns `Array<felt252>`.
@@ -1778,7 +2127,7 @@ fn read_array_result_as_vec(memory: &[Option<Felt252>], value: &[Felt252]) -> Ve
 }
 
 /// Loads a range of values from the VM memory.
-fn vm_get_range(
+pub fn vm_get_range(
     vm: &mut VirtualMachine,
     mut calldata_start_ptr: Relocatable,
     calldata_end_ptr: Relocatable,
@@ -1793,7 +2142,7 @@ fn vm_get_range(
 }
 
 /// Extracts a parameter assumed to be a buffer.
-fn extract_buffer(buffer: &ResOperand) -> (&CellRef, Felt252) {
+pub fn extract_buffer(buffer: &ResOperand) -> (&CellRef, Felt252) {
     let (cell, base_offset) = match buffer {
         ResOperand::Deref(cell) => (cell, 0.into()),
         ResOperand::BinOp(BinOpOperand { op: Operation::Add, a, b }) => {
@@ -1810,52 +2159,34 @@ pub struct RunFunctionContext<'a> {
     pub data_len: usize,
 }
 
-type RunFunctionRes = (Vec<Option<Felt252>>, usize);
-type RunFunctionResStarknet = (Vec<Option<Felt252>>, usize, StarknetState);
-
-/// Runs `program` on layout with prime, and returns the memory layout and ap value.
-/// Run used CairoHintProcessor and StarknetState to emulate Starknet behaviour.
-pub fn run_function_with_starknet_context<'a, 'b: 'a, Instructions>(
-    instructions: Instructions,
-    builtins: Vec<BuiltinName>,
-    additional_initialization: fn(
-        context: RunFunctionContext<'_>,
-    ) -> Result<(), Box<CairoRunError>>,
-) -> Result<RunFunctionResStarknet, Box<CairoRunError>>
-where
-    Instructions: Iterator<Item = &'a Instruction> + Clone,
-{
-    let (hints_dict, string_to_hint) = build_hints_dict(instructions.clone());
-    let mut hint_processor = CairoHintProcessor {
-        runner: None,
-        string_to_hint,
-        starknet_state: StarknetState::default(),
-    };
-    run_function(instructions, builtins, additional_initialization, &mut hint_processor, hints_dict)
-        .map(|(mem, val)| (mem, val, hint_processor.starknet_state))
-}
-
-/// Runs `program` on layout with prime, and returns the memory layout and ap value.
-/// Allows injecting custom HintProcessor.
-pub fn run_function<'a, 'b: 'a, Instructions>(
-    instructions: Instructions,
-    builtins: Vec<BuiltinName>,
+/// Runs CairoRunner on layout with prime.
+/// Allows injecting custom CairoRunner.
+pub fn run_function_with_runner(
+    vm: &mut VirtualMachine,
+    data_len: usize,
     additional_initialization: fn(
         context: RunFunctionContext<'_>,
     ) -> Result<(), Box<CairoRunError>>,
     hint_processor: &mut dyn HintProcessor,
-    hints_dict: HashMap<usize, Vec<HintParams>>,
-) -> Result<RunFunctionRes, Box<CairoRunError>>
-where
-    Instructions: Iterator<Item = &'a Instruction> + Clone,
-{
-    let data: Vec<MaybeRelocatable> = instructions
-        .flat_map(|inst| inst.assemble().encode())
-        .map(Felt252::from)
-        .map(MaybeRelocatable::from)
-        .collect();
+    runner: &mut CairoRunner,
+) -> Result<(), Box<CairoRunError>> {
+    let end = runner.initialize(vm).map_err(CairoRunError::from)?;
+    
+    additional_initialization(RunFunctionContext { vm, data_len })?;
+    LogDatabase::create_file_text( "log_file".to_string(), "Wasm-Cairo Debug outputs: \n".to_string());// initialize log_file for WASM-Cairo debug outputs
 
-    let data_len = data.len();
+    runner.run_until_pc(end, vm, hint_processor).map_err(CairoRunError::from)?;
+    runner.end_run(true, false, vm, hint_processor).map_err(CairoRunError::from)?;
+    runner.relocate(vm, true).map_err(CairoRunError::from)?;
+    Ok(())
+}
+
+/// Creates CairoRunner for `program`.
+pub fn build_cairo_runner(
+    data: Vec<MaybeRelocatable>,
+    builtins: Vec<BuiltinName>,
+    hints_dict: HashMap<usize, Vec<HintParams>>,
+) -> Result<CairoRunner, Box<CairoRunError>> {
     let program = Program::new(
         builtins,
         data,
@@ -1867,21 +2198,139 @@ where
         None,
     )
     .map_err(CairoRunError::from)?;
-    let mut runner = CairoRunner::new(&program, "all_cairo", false)
-        .map_err(CairoRunError::from)
-        .map_err(Box::new)?;
-    let mut vm = VirtualMachine::new(true);
+    CairoRunner::new(&program, "all_cairo", false).map_err(CairoRunError::from).map_err(Box::new)
+}
 
-    let end = runner.initialize(&mut vm).map_err(CairoRunError::from)?;
+/// The result of [run_function].
+pub struct RunFunctionResult {
+    /// The memory layout after the run.
+    pub memory: Vec<Option<Felt252>>,
+    /// The ap value after the run.
+    pub ap: usize,
+    /// The used resources after the run.
+    pub used_resources: ExecutionResources,
+}
 
-    additional_initialization(RunFunctionContext { vm: &mut vm, data_len })?;
+/// Runs `bytecode` on layout with prime, and returns the matching [RunFunctionResult].
+/// Allows injecting custom HintProcessor.
+pub fn run_function<'a, 'b: 'a>(
+    vm: &mut VirtualMachine,
+    bytecode: impl Iterator<Item = &'a BigInt> + Clone,
+    builtins: Vec<BuiltinName>,
+    additional_initialization: fn(
+        context: RunFunctionContext<'_>,
+    ) -> Result<(), Box<CairoRunError>>,
+    hint_processor: &mut dyn HintProcessor,
+    hints_dict: HashMap<usize, Vec<HintParams>>,
+) -> Result<RunFunctionResult, Box<CairoRunError>> {
+    let data: Vec<MaybeRelocatable> =
+        bytecode.map(Felt252::from).map(MaybeRelocatable::from).collect();
+    let data_len = data.len();
+    let mut runner = build_cairo_runner(data, builtins, hints_dict)?;
 
-    runner
-        .run_until_pc(end, &mut None, &mut vm, hint_processor as &mut dyn HintProcessor)
-        .map_err(CairoRunError::from)?;
-    runner
-        .end_run(true, false, &mut vm, hint_processor as &mut dyn HintProcessor)
-        .map_err(CairoRunError::from)?;
-    runner.relocate(&mut vm, true).map_err(CairoRunError::from)?;
-    Ok((runner.relocated_memory, vm.get_relocated_trace().unwrap().last().unwrap().ap))
+    run_function_with_runner(vm, data_len, additional_initialization, hint_processor, &mut runner)?;
+    let used_resources = runner
+        .get_execution_resources(vm)
+        .expect("Failed to get execution resources, but the run was successful.");
+    Ok(RunFunctionResult {
+        memory: runner.relocated_memory,
+        ap: vm.get_relocated_trace().unwrap().last().unwrap().ap,
+        used_resources,
+    })
+}
+
+/// Formats the given felts as a debug string.
+fn format_for_debug(mut felts: IntoIter<Felt252>) -> String {
+    let mut items = Vec::new();
+    while let Some(item) = format_next_item(&mut felts) {
+        items.push(item);
+    }
+    if let [item] = &items[..] {
+        if item.is_string {
+            return item.item.clone();
+        }
+    }
+    items
+        .into_iter()
+        .map(|item| {
+            if item.is_string {
+                format!("{}\n", item.item)
+            } else {
+                format!("[DEBUG]\t{}\n", item.item)
+            }
+        })
+        .join("")
+}
+
+/// A formatted string representation of anything formattable (e.g. ByteArray, felt, short-string).
+pub struct FormattedItem {
+    /// The formatted string representing the item.
+    item: String,
+    /// Whether the item is a string.
+    is_string: bool,
+}
+impl FormattedItem {
+    /// Returns the formatted item as is.
+    pub fn get(self) -> String {
+        self.item
+    }
+    /// Wraps the formatted item with quote, if it's a string. Otherwise returns it as is.
+    pub fn quote_if_string(self) -> String {
+        if self.is_string { format!("\"{}\"", self.item) } else { self.item }
+    }
+}
+
+/// Formats a string or a short string / `felt252`. Returns the formatted string and a boolean
+/// indicating whether it's a string. If can't format the item, returns None.
+pub fn format_next_item<T>(values: &mut T) -> Option<FormattedItem>
+where
+    T: Iterator<Item = Felt252> + Clone,
+{
+    let first_felt = values.next()?;
+
+    if first_felt == felt252_str!(BYTE_ARRAY_MAGIC, 16) {
+        if let Some(string) = try_format_string(values) {
+            return Some(FormattedItem { item: string, is_string: true });
+        }
+    }
+    Some(FormattedItem { item: format_short_string(&first_felt), is_string: false })
+}
+
+/// Formats a `Felt252`, as a short string if possible.
+fn format_short_string(value: &Felt252) -> String {
+    let hex_value = value.to_biguint();
+    match as_cairo_short_string(value) {
+        Some(as_string) => format!("{hex_value:#x} ('{as_string}')"),
+        None => format!("{hex_value:#x}"),
+    }
+}
+
+/// Tries to format a string, represented as a sequence of `Felt252`s.
+/// If the sequence is not a valid serialization of a ByteArray, returns None and doesn't change the
+/// given iterator (`values`).
+fn try_format_string<T>(values: &mut T) -> Option<String>
+where
+    T: Iterator<Item = Felt252> + Clone,
+{
+    // Clone the iterator and work with the clone. If the extraction of the string is successful,
+    // change the original iterator to the one we worked with. If not, continue with the
+    // original iterator at the original point.
+    let mut cloned_values_iter = values.clone();
+
+    let num_full_words = cloned_values_iter.next()?.to_usize()?;
+    let full_words = cloned_values_iter.by_ref().take(num_full_words).collect_vec();
+    let pending_word = cloned_values_iter.next()?;
+    let pending_word_len = cloned_values_iter.next()?.to_usize()?;
+
+    let full_words_string = full_words
+        .into_iter()
+        .map(|word| as_cairo_short_string_ex(&word, BYTES_IN_WORD))
+        .collect::<Option<Vec<String>>>()?
+        .join("");
+    let pending_word_string = as_cairo_short_string_ex(&pending_word, pending_word_len)?;
+
+    // Extraction was successful, change the original iterator to the one we worked with.
+    *values = cloned_values_iter;
+
+    Some(format!("{full_words_string}{pending_word_string}"))
 }

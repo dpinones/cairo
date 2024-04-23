@@ -41,15 +41,18 @@ pub fn starknet_libfunc_cost_base(libfunc: &StarkNetConcreteLibfunc) -> Vec<Cons
         StarkNetConcreteLibfunc::StorageAddressFromBaseAndOffset(_) => vec![steps(0)],
         StarkNetConcreteLibfunc::EmitEvent(_) => syscall_cost(4),
         StarkNetConcreteLibfunc::GetBlockHash(_) => syscall_cost(1),
-        StarkNetConcreteLibfunc::GetExecutionInfo(_) => syscall_cost(0),
+        StarkNetConcreteLibfunc::GetExecutionInfo(_)
+        | StarkNetConcreteLibfunc::GetExecutionInfoV2(_) => syscall_cost(0),
         StarkNetConcreteLibfunc::Deploy(_) => syscall_cost(5),
         StarkNetConcreteLibfunc::Keccak(_) => syscall_cost(2),
+        StarkNetConcreteLibfunc::SHA256ProcessBlock(_) => syscall_cost(3),
+        StarkNetConcreteLibfunc::SHA256StateHandleInit(_) => vec![steps(0)],
+        StarkNetConcreteLibfunc::SHA256StateHandleDigest(_) => vec![steps(0)],
         StarkNetConcreteLibfunc::LibraryCall(_) => syscall_cost(4),
         StarkNetConcreteLibfunc::ReplaceClass(_) => syscall_cost(1),
         StarkNetConcreteLibfunc::SendMessageToL1(_) => syscall_cost(3),
         StarkNetConcreteLibfunc::Testing(libfunc) => match libfunc {
-            TestingConcreteLibfunc::PopLog(_) => vec![steps(2), steps(2)],
-            _ => vec![steps(1)],
+            TestingConcreteLibfunc::Cheatcode(_) => vec![steps(1)],
         },
         StarkNetConcreteLibfunc::Secp256(libfunc) => {
             match libfunc {
@@ -73,7 +76,7 @@ pub fn starknet_libfunc_cost_base(libfunc: &StarkNetConcreteLibfunc) -> Vec<Cons
 }
 
 /// Returns the costs for system calls.
-fn syscall_cost(arg_count: i32) -> Vec<ConstCost> {
-    let cost = ConstCost { steps: SYSTEM_CALL_STEPS + 5 + arg_count, holes: 0, range_checks: 0 };
-    vec![cost.clone(), cost]
+fn syscall_cost(arg_size: i32) -> Vec<ConstCost> {
+    let cost = ConstCost { steps: SYSTEM_CALL_STEPS + 5 + arg_size, holes: 0, range_checks: 0 };
+    vec![cost, cost]
 }

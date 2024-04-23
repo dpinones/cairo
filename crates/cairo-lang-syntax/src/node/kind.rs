@@ -18,35 +18,48 @@ pub enum SyntaxKind {
     ExprParenthesized,
     ExprUnary,
     ExprBinary,
-    ExprTuple,
+    ExprListParenthesized,
     ExprFunctionCall,
     ArgListParenthesized,
     OptionArgListParenthesizedEmpty,
     ExprStructCtorCall,
+    StructArgListBraced,
     ExprBlock,
     ExprMatch,
     MatchArms,
     MatchArm,
     ExprIf,
+    ConditionLet,
+    ConditionExpr,
     ExprLoop,
+    ExprWhile,
     ElseClause,
     OptionElseClauseEmpty,
     ExprErrorPropagate,
     ExprIndexed,
     ExprInlineMacro,
+    ExprFixedSizeArray,
+    FixedSizeArraySize,
+    OptionFixedSizeArraySizeEmpty,
     StructArgExpr,
     OptionStructArgExprEmpty,
     StructArgSingle,
     StructArgTail,
     StructArgList,
     ArgListBraced,
+    ArgListBracketed,
+    WrappedArgListMissing,
     PatternIdentifier,
     PatternStruct,
     PatternStructParamList,
     PatternTuple,
+    PatternFixedSizeArray,
     PatternList,
+    PatternListOr,
     PatternStructParamWithExpr,
     PatternEnum,
+    PatternEnumInnerPattern,
+    OptionPatternEnumInnerPatternEmpty,
     TypeClause,
     OptionTypeClauseEmpty,
     ReturnTypeClause,
@@ -71,10 +84,16 @@ pub enum SyntaxKind {
     FunctionSignature,
     Member,
     MemberList,
-    ItemList,
-    ItemMissing,
+    Variant,
+    VariantList,
+    ModuleItemList,
+    ModuleItemMissing,
     Attribute,
     AttributeList,
+    VisibilityDefault,
+    VisibilityPubArgumentClause,
+    OptionVisibilityPubArgumentClauseEmpty,
+    VisibilityPub,
     ItemModule,
     ModuleBody,
     FunctionDeclaration,
@@ -87,7 +106,11 @@ pub enum SyntaxKind {
     TraitItemList,
     TraitItemMissing,
     TraitItemFunction,
+    TraitItemType,
+    TraitItemConstant,
+    TraitItemImpl,
     ItemImpl,
+    ItemInlineMacro,
     ImplBody,
     ImplItemList,
     ImplItemMissing,
@@ -102,7 +125,9 @@ pub enum SyntaxKind {
     UsePathList,
     AliasClause,
     OptionAliasClauseEmpty,
-    GenericArgExpr,
+    GenericArgNamed,
+    GenericArgUnnamed,
+    GenericArgValueExpr,
     GenericArgs,
     GenericArgList,
     OptionWrappedGenericParamListEmpty,
@@ -110,13 +135,18 @@ pub enum SyntaxKind {
     GenericParamList,
     GenericParamType,
     GenericParamConst,
-    GenericParamImpl,
+    GenericParamImplNamed,
+    GenericParamImplAnonymous,
+    GenericParamNegativeImpl,
+    TriviumSkippedNode,
     TokenIdentifier,
     TerminalIdentifier,
     TokenLiteralNumber,
     TerminalLiteralNumber,
     TokenShortString,
     TerminalShortString,
+    TokenString,
+    TerminalString,
     TokenAs,
     TerminalAs,
     TokenConst,
@@ -133,6 +163,8 @@ pub enum SyntaxKind {
     TerminalFunction,
     TokenIf,
     TerminalIf,
+    TokenWhile,
+    TerminalWhile,
     TokenLoop,
     TerminalLoop,
     TokenImpl,
@@ -169,6 +201,8 @@ pub enum SyntaxKind {
     TerminalType,
     TokenUse,
     TerminalUse,
+    TokenPub,
+    TerminalPub,
     TokenAnd,
     TerminalAnd,
     TokenAndAnd,
@@ -271,6 +305,7 @@ impl SyntaxKind {
             SyntaxKind::TokenIdentifier
                 | SyntaxKind::TokenLiteralNumber
                 | SyntaxKind::TokenShortString
+                | SyntaxKind::TokenString
                 | SyntaxKind::TokenAs
                 | SyntaxKind::TokenConst
                 | SyntaxKind::TokenElse
@@ -279,6 +314,7 @@ impl SyntaxKind {
                 | SyntaxKind::TokenFalse
                 | SyntaxKind::TokenFunction
                 | SyntaxKind::TokenIf
+                | SyntaxKind::TokenWhile
                 | SyntaxKind::TokenLoop
                 | SyntaxKind::TokenImpl
                 | SyntaxKind::TokenImplicits
@@ -297,6 +333,7 @@ impl SyntaxKind {
                 | SyntaxKind::TokenTrue
                 | SyntaxKind::TokenType
                 | SyntaxKind::TokenUse
+                | SyntaxKind::TokenPub
                 | SyntaxKind::TokenAnd
                 | SyntaxKind::TokenAndAnd
                 | SyntaxKind::TokenArrow
@@ -354,6 +391,7 @@ impl SyntaxKind {
             SyntaxKind::TerminalIdentifier
                 | SyntaxKind::TerminalLiteralNumber
                 | SyntaxKind::TerminalShortString
+                | SyntaxKind::TerminalString
                 | SyntaxKind::TerminalAs
                 | SyntaxKind::TerminalConst
                 | SyntaxKind::TerminalElse
@@ -362,6 +400,7 @@ impl SyntaxKind {
                 | SyntaxKind::TerminalFalse
                 | SyntaxKind::TerminalFunction
                 | SyntaxKind::TerminalIf
+                | SyntaxKind::TerminalWhile
                 | SyntaxKind::TerminalLoop
                 | SyntaxKind::TerminalImpl
                 | SyntaxKind::TerminalImplicits
@@ -380,6 +419,7 @@ impl SyntaxKind {
                 | SyntaxKind::TerminalTrue
                 | SyntaxKind::TerminalType
                 | SyntaxKind::TerminalUse
+                | SyntaxKind::TerminalPub
                 | SyntaxKind::TerminalAnd
                 | SyntaxKind::TerminalAndAnd
                 | SyntaxKind::TerminalArrow
@@ -437,6 +477,7 @@ impl SyntaxKind {
                 | SyntaxKind::TokenFalse
                 | SyntaxKind::TokenFunction
                 | SyntaxKind::TokenIf
+                | SyntaxKind::TokenWhile
                 | SyntaxKind::TokenLoop
                 | SyntaxKind::TokenImpl
                 | SyntaxKind::TokenImplicits
@@ -455,6 +496,7 @@ impl SyntaxKind {
                 | SyntaxKind::TokenTrue
                 | SyntaxKind::TokenType
                 | SyntaxKind::TokenUse
+                | SyntaxKind::TokenPub
         )
     }
     pub fn is_keyword_terminal(&self) -> bool {
@@ -468,6 +510,7 @@ impl SyntaxKind {
                 | SyntaxKind::TerminalFalse
                 | SyntaxKind::TerminalFunction
                 | SyntaxKind::TerminalIf
+                | SyntaxKind::TerminalWhile
                 | SyntaxKind::TerminalLoop
                 | SyntaxKind::TerminalImpl
                 | SyntaxKind::TerminalImplicits
@@ -486,6 +529,7 @@ impl SyntaxKind {
                 | SyntaxKind::TerminalTrue
                 | SyntaxKind::TerminalType
                 | SyntaxKind::TerminalUse
+                | SyntaxKind::TerminalPub
         )
     }
 }

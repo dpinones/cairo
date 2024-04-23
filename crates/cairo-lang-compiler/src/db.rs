@@ -1,26 +1,28 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use cairo_lang_defs::db::{DefsDatabase, DefsGroup, HasMacroPlugins};
-use cairo_lang_defs::plugin::MacroPlugin;
+use cairo_lang_defs::db::{DefsDatabase, DefsGroup};
+use cairo_lang_defs::plugin::{InlineMacroExprPlugin, MacroPlugin};
 use cairo_lang_filesystem::cfg::CfgSet;
 use cairo_lang_filesystem::db::{
     init_dev_corelib, init_files_group, AsFilesGroupMut, FilesDatabase, FilesGroup, FilesGroupEx,
     CORELIB_CRATE_NAME,
 };
-use cairo_lang_filesystem::detect::detect_corelib;
-use cairo_lang_filesystem::ids::CrateLongId;
-use cairo_lang_lowering::db::{LoweringDatabase, LoweringGroup};
+use cairo_lang_filesystem::detect::{detect_corelib, detect_dummy_corelib};
+use cairo_lang_filesystem::flag::Flag;
+use cairo_lang_filesystem::ids::FlagId;
+use cairo_lang_lowering::db::{init_lowering_group, LoweringDatabase, LoweringGroup};
 use cairo_lang_parser::db::ParserDatabase;
-use cairo_lang_plugins::get_default_plugins;
 use cairo_lang_project::ProjectConfig;
-use cairo_lang_semantic::db::{SemanticDatabase, SemanticGroup, SemanticGroupEx};
-use cairo_lang_semantic::plugin::SemanticPlugin;
+use cairo_lang_semantic::db::{SemanticDatabase, SemanticGroup};
+use cairo_lang_semantic::inline_macros::get_default_plugin_suite;
+use cairo_lang_semantic::plugin::{AnalyzerPlugin, PluginSuite};
 use cairo_lang_sierra_generator::db::SierraGenDatabase;
 use cairo_lang_syntax::node::db::{SyntaxDatabase, SyntaxGroup};
+use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::Upcast;
 
-use crate::project::update_crate_roots_from_project_config;
+use crate::project::{update_crate_root, update_crate_roots_from_project_config};
 
 #[salsa::database(
     DefsDatabase,
@@ -41,10 +43,17 @@ impl salsa::ParallelDatabase for RootDatabase {
     }
 }
 impl RootDatabase {
-    fn new(plugins: Vec<Arc<dyn SemanticPlugin>>) -> Self {
+    fn new(
+        plugins: Vec<Arc<dyn MacroPlugin>>,
+        inline_macro_plugins: OrderedHashMap<String, Arc<dyn InlineMacroExprPlugin>>,
+        analyzer_plugins: Vec<Arc<dyn AnalyzerPlugin>>,
+    ) -> Self {
         let mut res = Self { storage: Default::default() };
         init_files_group(&mut res);
-        res.set_semantic_plugins(plugins);
+        init_lowering_group(&mut res);
+        res.set_macro_plugins(plugins);
+        res.set_inline_macro_plugins(inline_macro_plugins.into());
+        res.set_analyzer_plugins(analyzer_plugins);
         res
     }
 
@@ -70,8 +79,9 @@ impl Default for RootDatabase {
 
 #[derive(Clone, Debug)]
 pub struct RootDatabaseBuilder {
-    plugins: Vec<Arc<dyn SemanticPlugin>>,
+    plugin_suite: PluginSuite,
     detect_corelib: bool,
+    auto_withdraw_gas: bool,
     project_config: Option<Box<ProjectConfig>>,
     cfg_set: Option<CfgSet>,
 }
@@ -79,20 +89,21 @@ pub struct RootDatabaseBuilder {
 impl RootDatabaseBuilder {
     fn new() -> Self {
         Self {
-            plugins: get_default_plugins(),
+            plugin_suite: get_default_plugin_suite(),
             detect_corelib: false,
+            auto_withdraw_gas: true,
             project_config: None,
             cfg_set: None,
         }
     }
 
-    pub fn with_semantic_plugin(&mut self, plugin: Arc<dyn SemanticPlugin>) -> &mut Self {
-        self.plugins.push(plugin);
+    pub fn with_plugin_suite(&mut self, suite: PluginSuite) -> &mut Self {
+        self.plugin_suite.add(suite);
         self
     }
 
     pub fn clear_plugins(&mut self) -> &mut Self {
-        self.plugins.clear();
+        self.plugin_suite = get_default_plugin_suite();
         self
     }
 
@@ -111,12 +122,21 @@ impl RootDatabaseBuilder {
         self
     }
 
+    pub fn skip_auto_withdraw_gas(&mut self) -> &mut Self {
+        self.auto_withdraw_gas = false;
+        self
+    }
+
     pub fn build(&mut self) -> Result<RootDatabase> {
         // NOTE: Order of operations matters here!
         //   Errors if something is not OK are very subtle, mostly this results in missing
         //   identifier diagnostics, or panics regarding lack of corelib items.
 
-        let mut db = RootDatabase::new(self.plugins.clone());
+        let mut db = RootDatabase::new(
+            self.plugin_suite.plugins.clone(),
+            self.plugin_suite.inline_macro_plugins.clone(),
+            self.plugin_suite.analyzer_plugins.clone(),
+        );
 
         if let Some(cfg_set) = &self.cfg_set {
             db.use_cfg(cfg_set);
@@ -124,16 +144,21 @@ impl RootDatabaseBuilder {
 
         if self.detect_corelib {
             let path =
-                detect_corelib().ok_or_else(|| anyhow!("Failed to find development corelib."))?;
-            init_dev_corelib(&mut db, path);
+                // detect_corelib().ok_or_else(|| anyhow!("Failed to find development corelib."))?;
+                detect_dummy_corelib().ok_or_else(|| anyhow!("Failed to find development corelib."))?;
+            init_dev_corelib(&mut db, path)
         }
 
-        if let Some(config) = self.project_config.clone() {
-            update_crate_roots_from_project_config(&mut db, *config.clone());
+        let add_withdraw_gas_flag_id = FlagId::new(db.upcast(), "add_withdraw_gas");
+        db.set_flag(
+            add_withdraw_gas_flag_id,
+            Some(Arc::new(Flag::AddWithdrawGas(self.auto_withdraw_gas))),
+        );
 
-            if let Some(corelib) = config.corelib {
-                let core_crate = db.intern_crate(CrateLongId(CORELIB_CRATE_NAME.into()));
-                db.set_crate_root(core_crate, Some(corelib));
+        if let Some(config) = &self.project_config {
+            update_crate_roots_from_project_config(&mut db, config.as_ref());
+            if let Some(corelib) = &config.corelib {
+                update_crate_root(&mut db, config, CORELIB_CRATE_NAME.into(), corelib.clone());
             }
         }
 
@@ -169,10 +194,5 @@ impl Upcast<dyn SemanticGroup> for RootDatabase {
 impl Upcast<dyn LoweringGroup> for RootDatabase {
     fn upcast(&self) -> &(dyn LoweringGroup + 'static) {
         self
-    }
-}
-impl HasMacroPlugins for RootDatabase {
-    fn macro_plugins(&self) -> Vec<Arc<dyn MacroPlugin>> {
-        self.get_macro_plugins()
     }
 }

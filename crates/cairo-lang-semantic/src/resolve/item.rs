@@ -1,6 +1,7 @@
 use cairo_lang_defs::ids::{
-    ConstantId, GenericTypeId, ImplAliasId, ImplDefId, ModuleId, ModuleItemId,
-    TopLevelLanguageElementId, TraitFunctionId, TraitId, TypeAliasId,
+    ConstantId, FunctionWithBodyId, GenericParamId, GenericTypeId, ImplAliasId, ImplDefId,
+    ModuleId, ModuleItemId, ModuleTypeAliasId, TopLevelLanguageElementId, TraitFunctionId, TraitId,
+    VarId,
 };
 use cairo_lang_diagnostics::Maybe;
 use cairo_lang_proc_macros::DebugWithDb;
@@ -24,11 +25,12 @@ pub enum ResolvedGenericItem {
     GenericFunction(GenericFunctionId),
     TraitFunction(TraitFunctionId),
     GenericType(GenericTypeId),
-    GenericTypeAlias(TypeAliasId),
+    GenericTypeAlias(ModuleTypeAliasId),
     GenericImplAlias(ImplAliasId),
     Variant(Variant),
     Trait(TraitId),
     Impl(ImplDefId),
+    Variable(FunctionWithBodyId, VarId),
 }
 impl ResolvedGenericItem {
     /// Wraps a ModuleItem with the corresponding ResolveGenericItem.
@@ -75,6 +77,7 @@ impl ResolvedGenericItem {
             ResolvedGenericItem::Variant(id) => id.id.full_path(defs_db),
             ResolvedGenericItem::Trait(id) => id.full_path(defs_db),
             ResolvedGenericItem::Impl(id) => id.full_path(defs_db),
+            ResolvedGenericItem::Variable(_, _) => "".into(),
         }
     }
 }
@@ -83,6 +86,7 @@ impl ResolvedGenericItem {
 #[debug_db(dyn SemanticGroup + 'static)]
 pub enum ResolvedConcreteItem {
     Constant(ConstantId),
+    ConstGenericParameter(GenericParamId),
     Module(ModuleId),
     Function(FunctionId),
     TraitFunction(ConcreteTraitGenericFunctionId),
@@ -91,16 +95,18 @@ pub enum ResolvedConcreteItem {
     Trait(ConcreteTraitId),
     Impl(ImplId),
 }
+
 impl ResolvedConcreteItem {
     pub fn generic(&self, db: &dyn SemanticGroup) -> Option<ResolvedGenericItem> {
         Some(match self {
             ResolvedConcreteItem::Constant(id) => ResolvedGenericItem::Constant(*id),
+            ResolvedConcreteItem::ConstGenericParameter(_) => return None,
             ResolvedConcreteItem::Module(item) => ResolvedGenericItem::Module(*item),
             ResolvedConcreteItem::Function(function) => ResolvedGenericItem::GenericFunction(
                 db.lookup_intern_function(*function).function.generic_function,
             ),
             ResolvedConcreteItem::TraitFunction(trait_function) => {
-                ResolvedGenericItem::TraitFunction(trait_function.function_id(db))
+                ResolvedGenericItem::TraitFunction(trait_function.trait_function(db))
             }
             ResolvedConcreteItem::Type(ty) => {
                 if let TypeLongId::Concrete(concrete) = db.lookup_intern_type(*ty) {

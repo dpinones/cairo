@@ -1,9 +1,12 @@
-use std::fmt::{Display, Formatter};
+#[cfg(not(feature = "std"))]
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+use core::fmt::{Display, Formatter};
 
-use indoc::writedoc;
-use parity_scale_codec_derive::{Decode, Encode};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use cairo_lang_utils::bigint::BigIntAsHex;
+use indoc::formatdoc;
 
 use crate::operand::{CellRef, DerefOrImmediate, ResOperand};
 
@@ -13,13 +16,24 @@ mod test;
 // Represents a cairo hint.
 // Note: Hint encoding should be backwards-compatible. This is an API guarantee.
 // For example, new variants should have new `index`.
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Encode, Decode, JsonSchema)]
-#[serde(untagged)]
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize), serde(untagged))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "parity-scale-codec",
+    derive(parity_scale_codec::Encode, parity_scale_codec::Decode)
+)]
 pub enum Hint {
-    #[codec(index = 0)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 0))]
     Core(CoreHintBase),
-    #[codec(index = 1)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
     Starknet(StarknetHint),
+}
+
+impl Hint {
+    pub fn representing_string(&self) -> String {
+        format!("{:?}", self)
+    }
 }
 
 impl From<CoreHint> for Hint {
@@ -33,62 +47,55 @@ impl From<StarknetHint> for Hint {
     }
 }
 
-impl Display for Hint {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+/// A trait for displaying the pythonic version of a hint.
+/// Should only be used from within the compiler.
+pub trait PythonicHint {
+    fn get_pythonic_hint(&self) -> String;
+}
+
+impl PythonicHint for Hint {
+    fn get_pythonic_hint(&self) -> String {
         match self {
-            Hint::Core(hint) => hint.fmt(f),
-            Hint::Starknet(hint) => hint.fmt(f),
+            Hint::Core(hint) => hint.get_pythonic_hint(),
+            Hint::Starknet(hint) => hint.get_pythonic_hint(),
         }
     }
 }
 
 /// Represents a hint that triggers a system call.
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Encode, Decode, JsonSchema)]
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "parity-scale-codec",
+    derive(parity_scale_codec::Encode, parity_scale_codec::Decode)
+)]
 pub enum StarknetHint {
-    #[codec(index = 0)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 0))]
     SystemCall { system: ResOperand },
-    #[codec(index = 1)]
-    SetBlockNumber { value: ResOperand },
-    #[codec(index = 2)]
-    SetBlockTimestamp { value: ResOperand },
-    #[codec(index = 3)]
-    SetCallerAddress { value: ResOperand },
-    #[codec(index = 4)]
-    SetContractAddress { value: ResOperand },
-    #[codec(index = 5)]
-    SetSequencerAddress { value: ResOperand },
-    #[codec(index = 6)]
-    SetVersion { value: ResOperand },
-    #[codec(index = 7)]
-    SetAccountContractAddress { value: ResOperand },
-    #[codec(index = 8)]
-    SetMaxFee { value: ResOperand },
-    #[codec(index = 9)]
-    SetTransactionHash { value: ResOperand },
-    #[codec(index = 10)]
-    SetChainId { value: ResOperand },
-    #[codec(index = 11)]
-    SetNonce { value: ResOperand },
-    #[codec(index = 12)]
-    SetSignature { start: ResOperand, end: ResOperand },
-    #[codec(index = 13)]
-    PopLog {
-        value: ResOperand,
-        opt_variant: CellRef,
-        keys_start: CellRef,
-        keys_end: CellRef,
-        data_start: CellRef,
-        data_end: CellRef,
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Cheatcode {
+        selector: BigIntAsHex,
+        input_start: ResOperand,
+        input_end: ResOperand,
+        output_start: CellRef,
+        output_end: CellRef,
     },
 }
 
 // Represents a cairo core hint.
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Encode, Decode, JsonSchema)]
-#[serde(untagged)]
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize), serde(untagged))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "parity-scale-codec",
+    derive(parity_scale_codec::Encode, parity_scale_codec::Decode)
+)]
 pub enum CoreHintBase {
-    #[codec(index = 0)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 0))]
     Core(CoreHint),
-    #[codec(index = 1)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
     Deprecated(DeprecatedHint),
 }
 
@@ -103,38 +110,33 @@ impl From<DeprecatedHint> for CoreHintBase {
     }
 }
 
-impl Display for CoreHintBase {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CoreHintBase::Core(hint) => hint.fmt(f),
-            CoreHintBase::Deprecated(_) => {
-                unreachable!("Deprecated hints do not have a pythonic version.")
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Encode, Decode, JsonSchema)]
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "parity-scale-codec",
+    derive(parity_scale_codec::Encode, parity_scale_codec::Decode)
+)]
 pub enum CoreHint {
-    #[codec(index = 0)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 0))]
     AllocSegment { dst: CellRef },
-    #[codec(index = 1)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
     TestLessThan { lhs: ResOperand, rhs: ResOperand, dst: CellRef },
-    #[codec(index = 2)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 2))]
     TestLessThanOrEqual { lhs: ResOperand, rhs: ResOperand, dst: CellRef },
     /// Multiplies two 128-bit integers and returns two 128-bit integers: the high and low parts of
     /// the product.
-    #[codec(index = 3)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 3))]
     WideMul128 { lhs: ResOperand, rhs: ResOperand, high: CellRef, low: CellRef },
     /// Computes lhs/rhs and returns the quotient and remainder.
     ///
     /// Note: the hint may be used to write an already assigned memory cell.
-    #[codec(index = 4)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 4))]
     DivMod { lhs: ResOperand, rhs: ResOperand, quotient: CellRef, remainder: CellRef },
     /// Divides dividend (represented by 2 128bit limbs) by divisor (represented by 2 128bit
     /// limbs). Returns the quotient (represented by 2 128bit limbs) and remainder (represented by
     /// 2 128bit limbs). In all cases - `name`0 is the least significant limb.
-    #[codec(index = 5)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 5))]
     Uint256DivMod {
         dividend0: ResOperand,
         dividend1: ResOperand,
@@ -149,7 +151,7 @@ pub enum CoreHint {
     /// limbs). Returns the quotient (represented by 4 128bit limbs) and remainder (represented
     /// by 2 128bit limbs).
     /// In all cases - `name`0 is the least significant limb.
-    #[codec(index = 6)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 6))]
     Uint512DivModByUint256 {
         dividend0: ResOperand,
         dividend1: ResOperand,
@@ -164,13 +166,13 @@ pub enum CoreHint {
         remainder0: CellRef,
         remainder1: CellRef,
     },
-    #[codec(index = 7)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 7))]
     SquareRoot { value: ResOperand, dst: CellRef },
     /// Computes the square root of value_low<<128+value_high, stores the 64bit limbs of the result
     /// in sqrt0 and sqrt1 as well as the 128bit limbs of the remainder in remainder_low and
     /// remainder_high. The remainder is defined as `value - sqrt**2`.
     /// Lastly it checks weather `2*sqrt - remainder >= 2**128`.
-    #[codec(index = 8)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 8))]
     Uint256SquareRoot {
         value_low: ResOperand,
         value_high: ResOperand,
@@ -181,23 +183,23 @@ pub enum CoreHint {
         sqrt_mul_2_minus_remainder_ge_u128: CellRef,
     },
     /// Finds some `x` and `y` such that `x * scalar + y = value` and `x <= max_x`.
-    #[codec(index = 9)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 9))]
     LinearSplit { value: ResOperand, scalar: ResOperand, max_x: ResOperand, x: CellRef, y: CellRef },
     /// Allocates a new dict segment, and write its start address into the dict_infos segment.
-    #[codec(index = 10)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 10))]
     AllocFelt252Dict { segment_arena_ptr: ResOperand },
     /// Fetch the previous value of a key in a dict, and write it in a new dict access.
-    #[codec(index = 11)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 11))]
     Felt252DictEntryInit { dict_ptr: ResOperand, key: ResOperand },
-    /// Similar to Felt252DictWrite, but updates an existing entry and does not wirte the previous
+    /// Similar to Felt252DictWrite, but updates an existing entry and does not write the previous
     /// value to the stack.
-    #[codec(index = 12)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 12))]
     Felt252DictEntryUpdate { dict_ptr: ResOperand, value: ResOperand },
     /// Retrieves the index of the given dict in the dict_infos segment.
-    #[codec(index = 13)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 13))]
     GetSegmentArenaIndex { dict_end_ptr: ResOperand, dict_index: CellRef },
     /// Initialized the lists of accesses of each key of a dict as a preparation of squash_dict.
-    #[codec(index = 14)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 14))]
     InitSquashData {
         dict_accesses: ResOperand,
         ptr_diff: ResOperand,
@@ -206,81 +208,119 @@ pub enum CoreHint {
         first_key: CellRef,
     },
     /// Retrieves the current index of a dict access to process.
-    #[codec(index = 15)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 15))]
     GetCurrentAccessIndex { range_check_ptr: ResOperand },
     /// Writes if the squash_dict loop should be skipped.
-    #[codec(index = 16)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 16))]
     ShouldSkipSquashLoop { should_skip_loop: CellRef },
     /// Writes the delta from the current access index to the next one.
-    #[codec(index = 17)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 17))]
     GetCurrentAccessDelta { index_delta_minus1: CellRef },
     /// Writes if the squash_dict loop should be continued.
-    #[codec(index = 18)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 18))]
     ShouldContinueSquashLoop { should_continue: CellRef },
     /// Writes the next dict key to process.
-    #[codec(index = 19)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 19))]
     GetNextDictKey { next_key: CellRef },
     /// Finds the two small arcs from within [(0,a),(a,b),(b,PRIME)] and writes it to the
     /// range_check segment.
-    #[codec(index = 20)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 20))]
     AssertLeFindSmallArcs { range_check_ptr: ResOperand, a: ResOperand, b: ResOperand },
     /// Writes if the arc (0,a) was excluded.
-    #[codec(index = 21)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 21))]
     AssertLeIsFirstArcExcluded { skip_exclude_a_flag: CellRef },
     /// Writes if the arc (a,b) was excluded.
-    #[codec(index = 22)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 22))]
     AssertLeIsSecondArcExcluded { skip_exclude_b_minus_a: CellRef },
     /// Samples a random point on the EC.
-    #[codec(index = 23)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 23))]
     RandomEcPoint { x: CellRef, y: CellRef },
     /// Computes the square root of `val`, if `val` is a quadratic residue, and of `3 * val`
     /// otherwise.
     ///
     /// Since 3 is not a quadratic residue, exactly one of `val` and `3 * val` is a quadratic
     /// residue (unless `val` is 0). This allows proving that `val` is not a quadratic residue.
-    #[codec(index = 24)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 24))]
     FieldSqrt { val: ResOperand, sqrt: CellRef },
     /// Prints the values from start to end.
     /// Both must be pointers.
-    #[codec(index = 25)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 25))]
     DebugPrint { start: ResOperand, end: ResOperand },
     /// Returns an address with `size` free locations afterwards.
-    #[codec(index = 26)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 26))]
     AllocConstantSize { size: ResOperand, dst: CellRef },
+    /// Provides the inverse of b (represented by 2 128-bit limbs) modulo n (represented by 2
+    /// 128-bit limbs), or a proof that b has no inverse.
+    ///
+    /// In case b has an inverse: Returns `r` and `k` such that:
+    ///   * `r = 1 / b (mod n)`
+    ///   * `k = (r * b - 1) / n`
+    ///   * `g0_or_no_inv = 0`
+    ///
+    /// In case b has no inverse: Returns `g`, `s`, and `t`, such that:
+    /// `g > 1`
+    /// `g == 2 || g % 2 == 1` (in particular, `g0_or_no_inv = g0 != 0`)
+    /// `g * s = b`
+    /// `g * t = n`
+    ///
+    /// The case `n == 1` is considered "no-inverse" (special case).
+    /// In this case: Returns `g == 1`, `s == b` and `t == 1`.
+    /// All no-inverse requirements are satisfied, except for `g > 1`.
+    ///
+    /// In all cases - `name`0 is the least significant limb.
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 27))]
+    U256InvModN {
+        b0: ResOperand,
+        b1: ResOperand,
+        n0: ResOperand,
+        n1: ResOperand,
+        g0_or_no_inv: CellRef,
+        g1_option: CellRef,
+        s_or_r0: CellRef,
+        s_or_r1: CellRef,
+        t_or_k0: CellRef,
+        t_or_k1: CellRef,
+    },
 }
 
 /// Represents a deprecated hint which is kept for backward compatibility of previously deployed
 /// contracts.
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Encode, Decode, JsonSchema)]
+#[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "parity-scale-codec",
+    derive(parity_scale_codec::Encode, parity_scale_codec::Decode)
+)]
 pub enum DeprecatedHint {
     /// Asserts that the current access indices list is empty (after the loop).
-    #[codec(index = 0)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 0))]
     AssertCurrentAccessIndicesIsEmpty,
     /// Asserts that the number of used accesses is equal to the length of the original accesses
     /// list.
-    #[codec(index = 1)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 1))]
     AssertAllAccessesUsed { n_used_accesses: CellRef },
     /// Asserts that the keys list is empty.
-    #[codec(index = 2)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 2))]
     AssertAllKeysUsed,
     /// Asserts that the arc (b, PRIME) was excluded.
-    #[codec(index = 3)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 3))]
     AssertLeAssertThirdArcExcluded,
     /// Asserts that the input represents integers and that a<b.
-    #[codec(index = 4)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 4))]
     AssertLtAssertValidInput { a: ResOperand, b: ResOperand },
     /// Retrieves and writes the value corresponding to the given dict and key from the vm
     /// dict_manager.
-    #[codec(index = 5)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 5))]
     Felt252DictRead { dict_ptr: ResOperand, key: ResOperand, value_dst: CellRef },
     /// Sets the value corresponding to the key in the vm dict_manager.
-    #[codec(index = 6)]
+    #[cfg_attr(feature = "parity-scale-codec", codec(index = 6))]
     Felt252DictWrite { dict_ptr: ResOperand, key: ResOperand, value: ResOperand },
 }
 
 struct DerefOrImmediateFormatter<'a>(&'a DerefOrImmediate);
 impl<'a> Display for DerefOrImmediateFormatter<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self.0 {
             DerefOrImmediate::Deref(d) => write!(f, "memory{d}"),
             DerefOrImmediate::Immediate(i) => write!(f, "{}", i.value),
@@ -288,13 +328,35 @@ impl<'a> Display for DerefOrImmediateFormatter<'a> {
     }
 }
 
-struct ResOperandFormatter<'a>(&'a ResOperand);
-impl<'a> Display for ResOperandFormatter<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+struct ResOperandAsIntegerFormatter<'a>(&'a ResOperand);
+impl<'a> Display for ResOperandAsIntegerFormatter<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self.0 {
             ResOperand::Deref(d) => write!(f, "memory{d}"),
             ResOperand::DoubleDeref(d, i) => write!(f, "memory[memory{d} + {i}]"),
             ResOperand::Immediate(i) => write!(f, "{}", i.value),
+            ResOperand::BinOp(bin_op) => {
+                write!(
+                    f,
+                    "(memory{} {} {}) % PRIME",
+                    bin_op.a,
+                    bin_op.op,
+                    DerefOrImmediateFormatter(&bin_op.b)
+                )
+            }
+        }
+    }
+}
+
+struct ResOperandAsAddressFormatter<'a>(&'a ResOperand);
+impl<'a> Display for ResOperandAsAddressFormatter<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            ResOperand::Deref(d) => write!(f, "memory{d}"),
+            ResOperand::DoubleDeref(d, i) => write!(f, "memory[memory{d} + {i}]"),
+            ResOperand::Immediate(i) => {
+                unreachable!("Address cannot be an immediate: {}.", i.value)
+            }
             ResOperand::BinOp(bin_op) => {
                 write!(
                     f,
@@ -308,14 +370,24 @@ impl<'a> Display for ResOperandFormatter<'a> {
     }
 }
 
-impl Display for CoreHint {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl PythonicHint for CoreHintBase {
+    fn get_pythonic_hint(&self) -> String {
         match self {
-            CoreHint::AllocSegment { dst } => write!(f, "memory{dst} = segments.add()"),
+            CoreHintBase::Core(hint) => hint.get_pythonic_hint(),
+            CoreHintBase::Deprecated(_) => {
+                unreachable!("Deprecated hints do not have a pythonic version.")
+            }
+        }
+    }
+}
+
+impl PythonicHint for CoreHint {
+    fn get_pythonic_hint(&self) -> String {
+        match self {
+            CoreHint::AllocSegment { dst } => format!("memory{dst} = segments.add()"),
             CoreHint::AllocFelt252Dict { segment_arena_ptr } => {
-                let segment_arena_ptr = ResOperandFormatter(segment_arena_ptr);
-                writedoc!(
-                    f,
+                let segment_arena_ptr = ResOperandAsAddressFormatter(segment_arena_ptr);
+                formatdoc!(
                     "
 
                         if '__dict_manager' not in globals():
@@ -346,9 +418,9 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::Felt252DictEntryInit { dict_ptr, key } => {
-                let (dict_ptr, key) = (ResOperandFormatter(dict_ptr), ResOperandFormatter(key));
-                writedoc!(
-                    f,
+                let (dict_ptr, key) =
+                    (ResOperandAsAddressFormatter(dict_ptr), ResOperandAsIntegerFormatter(key));
+                formatdoc!(
                     "
 
                     dict_tracker = __dict_manager.get_tracker({dict_ptr})
@@ -358,9 +430,9 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::Felt252DictEntryUpdate { dict_ptr, value } => {
-                let (dict_ptr, value) = (ResOperandFormatter(dict_ptr), ResOperandFormatter(value));
-                writedoc!(
-                    f,
+                let (dict_ptr, value) =
+                    (ResOperandAsAddressFormatter(dict_ptr), ResOperandAsIntegerFormatter(value));
+                formatdoc!(
                     "
 
                     dict_tracker = __dict_manager.get_tracker({dict_ptr})
@@ -368,29 +440,27 @@ impl Display for CoreHint {
                     "
                 )
             }
-            CoreHint::TestLessThan { lhs, rhs, dst } => write!(
-                f,
-                "memory{dst} = {} < {}",
-                ResOperandFormatter(lhs),
-                ResOperandFormatter(rhs)
-            ),
-            CoreHint::TestLessThanOrEqual { lhs, rhs, dst } => write!(
-                f,
+            CoreHint::TestLessThan { lhs, rhs, dst } => {
+                format!(
+                    "memory{dst} = {} < {}",
+                    ResOperandAsIntegerFormatter(lhs),
+                    ResOperandAsIntegerFormatter(rhs)
+                )
+            }
+            CoreHint::TestLessThanOrEqual { lhs, rhs, dst } => format!(
                 "memory{dst} = {} <= {}",
-                ResOperandFormatter(lhs),
-                ResOperandFormatter(rhs)
+                ResOperandAsIntegerFormatter(lhs),
+                ResOperandAsIntegerFormatter(rhs)
             ),
-            CoreHint::WideMul128 { lhs, rhs, high, low } => write!(
-                f,
+            CoreHint::WideMul128 { lhs, rhs, high, low } => format!(
                 "(memory{high}, memory{low}) = divmod({} * {}, 2**128)",
-                ResOperandFormatter(lhs),
-                ResOperandFormatter(rhs)
+                ResOperandAsIntegerFormatter(lhs),
+                ResOperandAsIntegerFormatter(rhs)
             ),
-            CoreHint::DivMod { lhs, rhs, quotient, remainder } => write!(
-                f,
+            CoreHint::DivMod { lhs, rhs, quotient, remainder } => format!(
                 "(memory{quotient}, memory{remainder}) = divmod({}, {})",
-                ResOperandFormatter(lhs),
-                ResOperandFormatter(rhs)
+                ResOperandAsIntegerFormatter(lhs),
+                ResOperandAsIntegerFormatter(rhs)
             ),
             CoreHint::Uint256DivMod {
                 dividend0,
@@ -403,13 +473,12 @@ impl Display for CoreHint {
                 remainder1,
             } => {
                 let (dividend0, dividend1, divisor0, divisor1) = (
-                    ResOperandFormatter(dividend0),
-                    ResOperandFormatter(dividend1),
-                    ResOperandFormatter(divisor0),
-                    ResOperandFormatter(divisor1),
+                    ResOperandAsIntegerFormatter(dividend0),
+                    ResOperandAsIntegerFormatter(dividend1),
+                    ResOperandAsIntegerFormatter(divisor0),
+                    ResOperandAsIntegerFormatter(divisor1),
                 );
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         dividend = {dividend0} + {dividend1} * 2**128
@@ -420,8 +489,7 @@ impl Display for CoreHint {
                         memory{remainder0} = remainder & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
                         memory{remainder1} = remainder >> 128
                     "
-                )?;
-                Ok(())
+                )
             }
             CoreHint::Uint512DivModByUint256 {
                 dividend0,
@@ -439,9 +507,8 @@ impl Display for CoreHint {
             } => {
                 let [dividend0, dividend1, dividend2, dividend3, divisor0, divisor1] =
                     [dividend0, dividend1, dividend2, dividend3, divisor0, divisor1]
-                        .map(ResOperandFormatter);
-                writedoc!(
-                    f,
+                        .map(ResOperandAsIntegerFormatter);
+                formatdoc!(
                     "
 
                     dividend = {dividend0} + {dividend1} * 2**128 + {dividend2} * 2**256 + \
@@ -458,14 +525,13 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::SquareRoot { value, dst } => {
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         import math
                         memory{dst} = math.isqrt({})
                     ",
-                    ResOperandFormatter(value)
+                    ResOperandAsIntegerFormatter(value)
                 )
             }
             CoreHint::Uint256SquareRoot {
@@ -477,10 +543,11 @@ impl Display for CoreHint {
                 remainder_high,
                 sqrt_mul_2_minus_remainder_ge_u128,
             } => {
-                let (value_low, value_high) =
-                    (ResOperandFormatter(value_low), ResOperandFormatter(value_high));
-                writedoc!(
-                    f,
+                let (value_low, value_high) = (
+                    ResOperandAsIntegerFormatter(value_low),
+                    ResOperandAsIntegerFormatter(value_high),
+                );
+                formatdoc!(
                     "
 
                         import math;
@@ -493,17 +560,15 @@ impl Display for CoreHint {
                         memory{remainder_high} = remainder >> 128
                         memory{sqrt_mul_2_minus_remainder_ge_u128} = root * 2 - remainder >= 2**128
                     "
-                )?;
-                Ok(())
+                )
             }
             CoreHint::LinearSplit { value, scalar, max_x, x, y } => {
                 let (value, scalar, max_x) = (
-                    ResOperandFormatter(value),
-                    ResOperandFormatter(scalar),
-                    ResOperandFormatter(max_x),
+                    ResOperandAsIntegerFormatter(value),
+                    ResOperandAsIntegerFormatter(scalar),
+                    ResOperandAsIntegerFormatter(max_x),
                 );
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         (value, scalar) = ({value}, {scalar})
@@ -515,8 +580,7 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::RandomEcPoint { x, y } => {
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         from starkware.crypto.signature.signature import ALPHA, BETA, FIELD_PRIME
@@ -526,8 +590,7 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::FieldSqrt { val, sqrt } => {
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         from starkware.crypto.signature.signature import FIELD_PRIME
@@ -539,24 +602,22 @@ impl Display for CoreHint {
                         else:
                             memory{sqrt} = sqrt(val * 3, FIELD_PRIME)
                         ",
-                    ResOperandFormatter(val)
+                    ResOperandAsIntegerFormatter(val)
                 )
             }
-            CoreHint::GetCurrentAccessIndex { range_check_ptr } => writedoc!(
-                f,
+            CoreHint::GetCurrentAccessIndex { range_check_ptr } => formatdoc!(
                 "
 
                     current_access_indices = sorted(access_indices[key])[::-1]
                     current_access_index = current_access_indices.pop()
                     memory[{}] = current_access_index
                 ",
-                ResOperandFormatter(range_check_ptr)
+                ResOperandAsAddressFormatter(range_check_ptr)
             ),
             CoreHint::ShouldSkipSquashLoop { should_skip_loop } => {
-                write!(f, "memory{should_skip_loop} = 0 if current_access_indices else 1")
+                format!("memory{should_skip_loop} = 0 if current_access_indices else 1")
             }
-            CoreHint::GetCurrentAccessDelta { index_delta_minus1 } => writedoc!(
-                f,
+            CoreHint::GetCurrentAccessDelta { index_delta_minus1 } => formatdoc!(
                 "
 
                     new_access_index = current_access_indices.pop()
@@ -565,19 +626,17 @@ impl Display for CoreHint {
                 "
             ),
             CoreHint::ShouldContinueSquashLoop { should_continue } => {
-                write!(f, "memory{should_continue} = 1 if current_access_indices else 0")
+                format!("memory{should_continue} = 1 if current_access_indices else 0")
             }
-            CoreHint::GetNextDictKey { next_key } => writedoc!(
-                f,
+            CoreHint::GetNextDictKey { next_key } => formatdoc!(
                 "
                     assert len(keys) > 0, 'No keys left but remaining_accesses > 0.'
                     memory{next_key} = key = keys.pop()
                 "
             ),
             CoreHint::GetSegmentArenaIndex { dict_end_ptr, dict_index } => {
-                let dict_end_ptr = ResOperandFormatter(dict_end_ptr);
-                writedoc!(
-                    f,
+                let dict_end_ptr = ResOperandAsAddressFormatter(dict_end_ptr);
+                formatdoc!(
                     "
 
                     memory{dict_index} = __segment_index_to_arena_index[
@@ -594,12 +653,11 @@ impl Display for CoreHint {
                 first_key,
             } => {
                 let (dict_accesses, ptr_diff, n_accesses) = (
-                    ResOperandFormatter(dict_accesses),
-                    ResOperandFormatter(ptr_diff),
-                    ResOperandFormatter(n_accesses),
+                    ResOperandAsAddressFormatter(dict_accesses),
+                    ResOperandAsIntegerFormatter(ptr_diff),
+                    ResOperandAsIntegerFormatter(n_accesses),
                 );
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                     dict_access_size = 3
@@ -626,12 +684,11 @@ impl Display for CoreHint {
             }
             CoreHint::AssertLeFindSmallArcs { range_check_ptr, a, b } => {
                 let (range_check_ptr, a, b) = (
-                    ResOperandFormatter(range_check_ptr),
-                    ResOperandFormatter(a),
-                    ResOperandFormatter(b),
+                    ResOperandAsAddressFormatter(range_check_ptr),
+                    ResOperandAsIntegerFormatter(a),
+                    ResOperandAsIntegerFormatter(b),
                 );
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                     import itertools
@@ -658,13 +715,12 @@ impl Display for CoreHint {
                 )
             }
             CoreHint::AssertLeIsFirstArcExcluded { skip_exclude_a_flag } => {
-                write!(f, "memory{skip_exclude_a_flag} = 1 if excluded != 0 else 0",)
+                format!("memory{skip_exclude_a_flag} = 1 if excluded != 0 else 0",)
             }
             CoreHint::AssertLeIsSecondArcExcluded { skip_exclude_b_minus_a } => {
-                write!(f, "memory{skip_exclude_b_minus_a} = 1 if excluded != 1 else 0",)
+                format!("memory{skip_exclude_b_minus_a} = 1 if excluded != 1 else 0",)
             }
-            CoreHint::DebugPrint { start, end } => writedoc!(
-                f,
+            CoreHint::DebugPrint { start, end } => formatdoc!(
                 "
 
                     curr = {}
@@ -673,12 +729,11 @@ impl Display for CoreHint {
                         print(hex(memory[curr]))
                         curr += 1
                 ",
-                ResOperandFormatter(start),
-                ResOperandFormatter(end),
+                ResOperandAsAddressFormatter(start),
+                ResOperandAsAddressFormatter(end),
             ),
             CoreHint::AllocConstantSize { size, dst } => {
-                writedoc!(
-                    f,
+                formatdoc!(
                     "
 
                         if '__boxed_segment' not in globals():
@@ -686,78 +741,74 @@ impl Display for CoreHint {
                         memory{dst} = __boxed_segment
                         __boxed_segment += {}
                     ",
-                    ResOperandFormatter(size)
+                    ResOperandAsIntegerFormatter(size)
+                )
+            }
+            CoreHint::U256InvModN {
+                b0,
+                b1,
+                n0,
+                n1,
+                g0_or_no_inv,
+                g1_option,
+                s_or_r0,
+                s_or_r1,
+                t_or_k0,
+                t_or_k1,
+            } => {
+                let [b0, b1, n0, n1] = [b0, b1, n0, n1].map(ResOperandAsIntegerFormatter);
+                formatdoc!(
+                    "
+
+                        from starkware.python.math_utils import igcdex
+
+                        b = {b0} + ({b1} << 128)
+                        n = {n0} + ({n1} << 128)
+
+                        (_, r, g) = igcdex(n, b)
+                        if n == 1:
+                            memory{g0_or_no_inv} = 1
+                            memory{g1_option} = 0
+                            memory{s_or_r0} = {b0}
+                            memory{s_or_r1} = {b1}
+                            memory{t_or_k0} = 1
+                            memory{t_or_k1} = 0
+                        elif g != 1:
+                            if g % 2 == 0:
+                                g = 2
+                            s = b // g
+                            t = n // g
+                            memory{g0_or_no_inv} = g & 0xffffffffffffffffffffffffffffffff
+                            memory{g1_option} = g >> 128
+                            memory{s_or_r0} = s & 0xffffffffffffffffffffffffffffffff
+                            memory{s_or_r1} = s >> 128
+                            memory{t_or_k0} = t & 0xffffffffffffffffffffffffffffffff
+                            memory{t_or_k1} = t >> 128
+                        else:
+                            r %= n
+                            k = (r * b - 1) // n
+                            memory{g0_or_no_inv} = 0
+                            memory{s_or_r0} = r & 0xffffffffffffffffffffffffffffffff
+                            memory{s_or_r1} = r >> 128
+                            memory{t_or_k0} = k & 0xffffffffffffffffffffffffffffffff
+                            memory{t_or_k1} = k >> 128
+                    "
                 )
             }
         }
     }
 }
 
-impl Display for StarknetHint {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl PythonicHint for StarknetHint {
+    fn get_pythonic_hint(&self) -> String {
         match self {
             StarknetHint::SystemCall { system } => {
-                write!(f, "syscall_handler.syscall(syscall_ptr={})", ResOperandFormatter(system))
-            }
-            StarknetHint::SetBlockNumber { value } => {
-                write!(f, "syscall_handler.block_number = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetBlockTimestamp { value } => {
-                write!(f, "syscall_handler.block_timestamp = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetCallerAddress { value } => {
-                write!(f, "syscall_handler.caller_address = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetContractAddress { value } => {
-                write!(f, "syscall_handler.contract_address = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetSequencerAddress { value } => {
-                write!(f, "syscall_handler.sequencer_address = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetVersion { value } => {
-                write!(f, "syscall_handler.tx_info.version = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetAccountContractAddress { value } => {
-                write!(
-                    f,
-                    "syscall_handler.tx_info.account_contract_address = {}",
-                    ResOperandFormatter(value)
+                format!(
+                    "syscall_handler.syscall(syscall_ptr={})",
+                    ResOperandAsAddressFormatter(system)
                 )
             }
-            StarknetHint::SetMaxFee { value } => {
-                write!(f, "syscall_handler.tx_info.max_fee = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetTransactionHash { value } => {
-                write!(
-                    f,
-                    "syscall_handler.tx_info.transaction_hash = {}",
-                    ResOperandFormatter(value)
-                )
-            }
-            StarknetHint::SetChainId { value } => {
-                write!(f, "syscall_handler.tx_info.chain_id = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetNonce { value } => {
-                write!(f, "syscall_handler.tx_info.nonce = {}", ResOperandFormatter(value))
-            }
-            StarknetHint::SetSignature { start, end } => {
-                write!(
-                    f,
-                    "syscall_handler.tx_info.signature = [memory[i] for i in range({}, {})]",
-                    ResOperandFormatter(start),
-                    ResOperandFormatter(end)
-                )
-            }
-            StarknetHint::PopLog {
-                value: _,
-                opt_variant: _,
-                keys_start: _,
-                keys_end: _,
-                data_start: _,
-                data_end: _,
-            } => {
-                write!(f, "raise NotImplemented")
-            }
+            StarknetHint::Cheatcode { .. } => "raise NotImplementedError".to_string(),
         }
     }
 }

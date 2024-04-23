@@ -7,6 +7,7 @@ mod block_generator;
 pub mod canonical_id_replacer;
 pub mod db;
 mod expr_generator_context;
+mod extra_sierra_info;
 mod function_generator;
 #[cfg(any(feature = "testing", test))]
 pub mod function_generator_test_utils;
@@ -15,10 +16,12 @@ mod lifetime;
 mod local_variables;
 mod next_statement_index_fetch;
 pub mod pre_sierra;
-mod program_generator;
+pub mod program_generator;
 pub mod replace_ids;
 mod resolve_labels;
 mod specialization_context;
+pub mod statements_functions;
+pub mod statements_locations;
 mod store_variables;
 #[cfg(any(feature = "testing", test))]
 pub mod test_utils;

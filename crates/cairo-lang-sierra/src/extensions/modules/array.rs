@@ -1,12 +1,14 @@
+use super::boxing::box_ty;
 use super::range_check::RangeCheckType;
 use super::snapshot::snapshot_ty;
-use super::starknet::getter::boxed_ty;
+use super::structure::StructConcreteType;
 use crate::define_libfunc_hierarchy;
 use crate::extensions::lib_func::{
     BranchSignature, DeferredOutputKind, LibfuncSignature, OutputVarInfo, ParamSignature,
     SierraApChange, SignatureAndTypeGenericLibfunc, SignatureOnlyGenericLibfunc,
     SignatureSpecializationContext, WrapSignatureAndTypeGenericLibfunc,
 };
+use crate::extensions::type_specialization_context::TypeSpecializationContext;
 use crate::extensions::types::{
     GenericTypeArgGenericType, GenericTypeArgGenericTypeWrapper, TypeInfo,
 };
@@ -26,6 +28,7 @@ impl GenericTypeArgGenericType for ArrayTypeWrapped {
 
     fn calc_info(
         &self,
+        _context: &dyn TypeSpecializationContext,
         long_id: crate::program::ConcreteTypeLongId,
         TypeInfo { storable, droppable, zero_sized, .. }: TypeInfo,
     ) -> Result<TypeInfo, SpecializationError> {
@@ -47,6 +50,7 @@ pub type ArrayType = GenericTypeArgGenericTypeWrapper<ArrayTypeWrapped>;
 define_libfunc_hierarchy! {
     pub enum ArrayLibfunc {
         New(ArrayNewLibfunc),
+        SpanFromTuple(SpanFromTupleLibfunc),
         Append(ArrayAppendLibfunc),
         PopFront(ArrayPopFrontLibfunc),
         PopFrontConsume(ArrayPopFrontConsumeLibfunc),
@@ -80,6 +84,51 @@ impl SignatureOnlyGenericLibfunc for ArrayNewLibfunc {
         ))
     }
 }
+
+/// Libfunc for creating a span from a box of struct of members of the same type.
+#[derive(Default)]
+pub struct SpanFromTupleLibfuncWrapped;
+impl SignatureAndTypeGenericLibfunc for SpanFromTupleLibfuncWrapped {
+    const STR_ID: &'static str = "span_from_tuple";
+
+    fn specialize_signature(
+        &self,
+        context: &dyn SignatureSpecializationContext,
+        ty: ConcreteTypeId,
+    ) -> Result<LibfuncSignature, SpecializationError> {
+        let struct_type = StructConcreteType::try_from_concrete_type(context, &ty)?;
+        if struct_type.info.zero_sized {
+            return Err(SpecializationError::UnsupportedGenericArg);
+        }
+
+        let member_type =
+            struct_type.members.first().ok_or(SpecializationError::UnsupportedGenericArg)?;
+        // Validate all members are of the same type.
+        for member in &struct_type.members {
+            if member != member_type {
+                return Err(SpecializationError::UnsupportedGenericArg);
+            }
+        }
+
+        let input_ty = box_ty(context, snapshot_ty(context, ty)?)?;
+
+        Ok(LibfuncSignature::new_non_branch(
+            vec![input_ty],
+            vec![OutputVarInfo {
+                ty: snapshot_ty(
+                    context,
+                    context.get_wrapped_concrete_type(ArrayType::id(), member_type.clone())?,
+                )?,
+                ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::AddConst {
+                    param_idx: 0,
+                }),
+            }],
+            SierraApChange::Known { new_vars_only: true },
+        ))
+    }
+}
+
+pub type SpanFromTupleLibfunc = WrapSignatureAndTypeGenericLibfunc<SpanFromTupleLibfuncWrapped>;
 
 /// Libfunc for getting the length of the array.
 #[derive(Default)]
@@ -159,7 +208,7 @@ impl SignatureAndTypeGenericLibfunc for ArrayPopFrontLibfuncWrapped {
                             ),
                         },
                         OutputVarInfo {
-                            ty: boxed_ty(context, ty)?,
+                            ty: box_ty(context, ty)?,
                             ref_info: OutputVarReferenceInfo::PartialParam { param_idx: 0 },
                         },
                     ],
@@ -205,7 +254,7 @@ impl SignatureAndTypeGenericLibfunc for ArrayPopFrontConsumeLibfuncWrapped {
                             ),
                         },
                         OutputVarInfo {
-                            ty: boxed_ty(context, ty)?,
+                            ty: box_ty(context, ty)?,
                             ref_info: OutputVarReferenceInfo::PartialParam { param_idx: 0 },
                         },
                     ],
@@ -251,7 +300,7 @@ impl SignatureAndTypeGenericLibfunc for ArrayGetLibfuncWrapped {
                 vars: vec![
                     rc_output_info.clone(),
                     OutputVarInfo {
-                        ty: boxed_ty(context, snapshot_ty(context, ty)?)?,
+                        ty: box_ty(context, snapshot_ty(context, ty)?)?,
                         ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::Generic),
                     },
                 ],
@@ -292,11 +341,12 @@ impl SignatureAndTypeGenericLibfunc for ArraySliceLibfuncWrapped {
         ];
         let rc_output_info = OutputVarInfo::new_builtin(range_check_type, 0);
         let branch_signatures = vec![
-            // First (success) branch returns rc, array and the slice snapshot; failure branch does
-            // not return an element.
+            // Success.
             BranchSignature {
                 vars: vec![
+                    // Range check.
                     rc_output_info.clone(),
+                    // Array slice snapshot.
                     OutputVarInfo {
                         ty: arr_snapshot_type,
                         ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::Generic),
@@ -304,6 +354,7 @@ impl SignatureAndTypeGenericLibfunc for ArraySliceLibfuncWrapped {
                 ],
                 ap_change: SierraApChange::Known { new_vars_only: false },
             },
+            // Failure - returns only the range check buffer.
             BranchSignature {
                 vars: vec![rc_output_info],
                 ap_change: SierraApChange::Known { new_vars_only: false },
@@ -339,7 +390,7 @@ impl SignatureAndTypeGenericLibfunc for ArraySnapshotPopFrontLibfuncWrapped {
                             ),
                         },
                         OutputVarInfo {
-                            ty: boxed_ty(context, snapshot_ty(context, ty)?)?,
+                            ty: box_ty(context, snapshot_ty(context, ty)?)?,
                             ref_info: OutputVarReferenceInfo::PartialParam { param_idx: 0 },
                         },
                     ],
@@ -385,7 +436,7 @@ impl SignatureAndTypeGenericLibfunc for ArraySnapshotPopBackLibfuncWrapped {
                             ),
                         },
                         OutputVarInfo {
-                            ty: boxed_ty(context, snapshot_ty(context, ty)?)?,
+                            ty: box_ty(context, snapshot_ty(context, ty)?)?,
                             ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::Generic),
                         },
                     ],

@@ -24,7 +24,7 @@ pub fn build(
     builder: CompiledInvocationBuilder<'_>,
 ) -> Result<CompiledInvocation, InvocationError> {
     match libfunc {
-        EcConcreteLibfunc::IsZero(_) => build_is_zero(builder),
+        EcConcreteLibfunc::IsZero(_) => build_ec_point_is_zero(builder),
         EcConcreteLibfunc::Neg(_) => build_ec_neg(builder),
         EcConcreteLibfunc::StateAdd(_) => build_ec_state_add(builder),
         EcConcreteLibfunc::TryNew(_) => build_ec_point_try_new_nz(builder),
@@ -260,7 +260,7 @@ fn build_ec_point_unwrap(
 }
 
 /// Generates casm instructions for `ec_point_is_zero()`.
-fn build_is_zero(
+fn build_ec_point_is_zero(
     builder: CompiledInvocationBuilder<'_>,
 ) -> Result<CompiledInvocation, InvocationError> {
     let [x, y] = builder.try_get_refs::<1>()?[0].try_unpack()?;
@@ -312,7 +312,7 @@ fn build_ec_state_init(
 
     // Sample a random point on the curve.
     casm_build_extend! {casm_builder,
-        // Auxilliary variables.
+        // Auxiliary variables.
         tempvar y2;
         tempvar aux0;
         tempvar aux1;
@@ -323,7 +323,7 @@ fn build_ec_state_init(
         tempvar random_y;
         tempvar random_ptr;
         hint RandomEcPoint {} into { x: random_x, y: random_y };
-        // Initalize `random_ptr` and copy the random point into it.
+        // Initialize `random_ptr` and copy the random point into it.
         const ec_point_size = 2;
         hint AllocConstantSize { size: ec_point_size } into {dst: random_ptr};
         assert random_x = random_ptr[0];
@@ -366,6 +366,8 @@ fn build_ec_state_add(
         jump NotSameX if denominator != 0;
         // X coordinate is identical; either the sum of the points is the point at infinity (not
         // allowed), or the points are equal, which is also not allowed (doubling).
+        // Since the base state should be random - the only way to get the same point twice is if
+        // the prover chose a non-random state, so we explicitly fail.
         fail;
         NotSameX:
         tempvar numerator = py - sy;
@@ -406,6 +408,8 @@ fn build_ec_state_finalize(
         jump NotSameX if denominator != 0;
         // Assert the result is the point at infinity (the other option is the points are the same,
         // and doubling is not allowed).
+        // Since the base state should be random - the only way to get the same point twice is if
+        // the prover chose a non-random state.
         assert y = random_y;
         jump SumIsInfinity;
         NotSameX:
@@ -414,16 +418,13 @@ fn build_ec_state_finalize(
         tempvar numerator = y + random_y;
     }
 
-    let (result_x, result_y) =
-        add_ec_points_inner(&mut casm_builder, (x, y), random_x, numerator, denominator);
+    let result_x_y: [Var; 2] =
+        add_ec_points_inner(&mut casm_builder, (x, y), random_x, numerator, denominator).into();
 
     let failure_handle = get_non_fallthrough_statement_id(&builder);
     Ok(builder.build_from_casm_builder(
         casm_builder,
-        [
-            ("Fallthrough", &[&[result_x, result_y]], None),
-            ("SumIsInfinity", &[], Some(failure_handle)),
-        ],
+        [("Fallthrough", &[&result_x_y], None), ("SumIsInfinity", &[], Some(failure_handle))],
         Default::default(),
     ))
 }

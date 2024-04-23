@@ -4,17 +4,108 @@ use std::sync::Arc;
 
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::Upcast;
+use serde::{Deserialize, Serialize};
 
 use crate::cfg::CfgSet;
 use crate::flag::Flag;
-use crate::ids::{CrateId, CrateLongId, Directory, FileId, FileLongId, FlagId, FlagLongId};
-use crate::span::{FileSummary, TextOffset, TextWidth};
+use crate::ids::{
+    CrateId, CrateLongId, Directory, FileId, FileLongId, FlagId, FlagLongId, VirtualFile,
+};
+use crate::span::{FileSummary, TextOffset, TextSpan, TextWidth};
+
+use rust_embed::RustEmbed;
+use std::io::Result;
+
+#[derive(RustEmbed)]
+#[folder = "corelib/src/"]
+struct Asset;
 
 #[cfg(test)]
 #[path = "db_test.rs"]
 mod test;
 
 pub const CORELIB_CRATE_NAME: &str = "core";
+
+/// A configuration per crate.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct CrateConfiguration {
+    /// The root directory of the crate.
+    pub root: Directory,
+    pub settings: CrateSettings,
+}
+impl CrateConfiguration {
+    /// Returns a new configuration.
+    pub fn default_for_root(root: Directory) -> Self {
+        Self { root, settings: CrateSettings::default() }
+    }
+}
+
+/// Same as `CrateConfiguration` but without the root directory..
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrateSettings {
+    /// The crate's Cairo edition.
+    pub edition: Edition,
+
+    pub cfg_set: Option<CfgSet>,
+
+    #[serde(default)]
+    pub experimental_features: ExperimentalFeaturesConfig,
+}
+
+/// The Cairo edition of a crate.
+/// Editions are a mechanism to allow breaking changes in the compiler.
+/// Compiler minor version updates will always support all editions supported by the previous
+/// updates with the same major version. Compiler major version updates may remove support for older
+/// editions. Editions may be added to provide features that are not backwards compatible, while
+/// allowing user to opt-in to them, and be ready for later compiler updates.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Edition {
+    /// The base edition, dated for the first release of the compiler.
+    #[default]
+    #[serde(rename = "2023_01")]
+    V2023_01,
+    #[serde(rename = "2023_10")]
+    V2023_10,
+    #[serde(rename = "2023_11")]
+    V2023_11,
+}
+impl Edition {
+    /// Returns the latest stable edition.
+    ///
+    /// This Cairo edition is recommended for use in new projects and, in case of existing projects,
+    /// to migrate to when possible.
+    pub const fn latest() -> Self {
+        Self::V2023_11
+    }
+
+    /// The name of the prelude submodule of `core::prelude` for this compatibility version.
+    pub fn prelude_submodule_name(&self) -> &str {
+        match self {
+            Self::V2023_01 => "v2023_01",
+            Self::V2023_10 | Self::V2023_11 => "v2023_10",
+        }
+    }
+
+    /// Whether to ignore visibility modifiers.
+    pub fn ignore_visibility(&self) -> bool {
+        match self {
+            Self::V2023_01 | Self::V2023_10 => true,
+            Self::V2023_11 => false,
+        }
+    }
+}
+
+/// Configuration per crate.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentalFeaturesConfig {
+    pub negative_impls: bool,
+    /// Allows using coupon types and coupon calls.
+    ///
+    /// Each function has a associated `Coupon` type, which represents paying the cost of the
+    /// function before calling it.
+    #[serde(default)]
+    pub coupons: bool,
+}
 
 // Salsa database interface.
 #[salsa::query_group(FilesDatabase)]
@@ -26,9 +117,9 @@ pub trait FilesGroup {
     #[salsa::interned]
     fn intern_flag(&self, flag: FlagLongId) -> FlagId;
 
-    /// Main input of the project. Lists all the crates.
+    /// Main input of the project. Lists all the crates configurations.
     #[salsa::input]
-    fn crate_roots(&self) -> Arc<OrderedHashMap<CrateId, Directory>>;
+    fn crate_configs(&self) -> Arc<OrderedHashMap<CrateId, CrateConfiguration>>;
 
     /// Overrides for file content. Mostly used by language server and tests.
     /// TODO(spapini): Currently, when this input changes, all the file_content() queries will
@@ -48,8 +139,8 @@ pub trait FilesGroup {
 
     /// List of crates in the project.
     fn crates(&self) -> Vec<CrateId>;
-    /// Root directory of the crate.
-    fn crate_root_dir(&self, crate_id: CrateId) -> Option<Directory>;
+    /// Configuration of the crate.
+    fn crate_config(&self, crate_id: CrateId) -> Option<CrateConfiguration>;
 
     /// Query for raw file contents. Private.
     fn priv_raw_file_content(&self, file_id: FileId) -> Option<Arc<String>>;
@@ -64,15 +155,27 @@ pub trait FilesGroup {
 pub fn init_files_group(db: &mut (dyn FilesGroup + 'static)) {
     // Initialize inputs.
     db.set_file_overrides(Arc::new(OrderedHashMap::default()));
-    db.set_crate_roots(Arc::new(OrderedHashMap::default()));
+    db.set_crate_configs(Arc::new(OrderedHashMap::default()));
     db.set_flags(Arc::new(OrderedHashMap::default()));
     db.set_cfg_set(Arc::new(CfgSet::new()));
 }
 
-pub fn init_dev_corelib(db: &mut (dyn FilesGroup + 'static), path: PathBuf) {
-    let core_crate = db.intern_crate(CrateLongId(CORELIB_CRATE_NAME.into()));
-    let core_root_dir = Directory(path);
-    db.set_crate_root(core_crate, Some(core_root_dir));
+pub fn init_dev_corelib(db: &mut (dyn FilesGroup + 'static), core_lib_dir: PathBuf) {
+    let core_crate = db.intern_crate(CrateLongId::Real(CORELIB_CRATE_NAME.into()));
+    db.set_crate_config(
+        core_crate,
+        Some(CrateConfiguration {
+            root: Directory::Real(core_lib_dir),
+            settings: CrateSettings {
+                edition: Edition::V2023_11,
+                cfg_set: Default::default(),
+                experimental_features: ExperimentalFeaturesConfig {
+                    negative_impls: true,
+                    coupons: true,
+                },
+            },
+        }),
+    );
 }
 
 impl AsFilesGroupMut for dyn FilesGroup {
@@ -92,13 +195,13 @@ pub trait FilesGroupEx: Upcast<dyn FilesGroup> + AsFilesGroupMut {
         self.as_files_group_mut().set_file_overrides(Arc::new(overrides));
     }
     /// Sets the root directory of the crate. None value removes the crate.
-    fn set_crate_root(&mut self, crt: CrateId, root: Option<Directory>) {
-        let mut crate_roots = Upcast::upcast(self).crate_roots().as_ref().clone();
+    fn set_crate_config(&mut self, crt: CrateId, root: Option<CrateConfiguration>) {
+        let mut crate_configs = Upcast::upcast(self).crate_configs().as_ref().clone();
         match root {
-            Some(root) => crate_roots.insert(crt, root),
-            None => crate_roots.swap_remove(&crt),
+            Some(root) => crate_configs.insert(crt, root),
+            None => crate_configs.swap_remove(&crt),
         };
-        self.as_files_group_mut().set_crate_roots(Arc::new(crate_roots));
+        self.as_files_group_mut().set_crate_configs(Arc::new(crate_configs));
     }
     /// Sets the given flag value. None value removes the flag.
     fn set_flag(&mut self, id: FlagId, value: Option<Arc<Flag>>) {
@@ -124,15 +227,32 @@ pub trait AsFilesGroupMut {
 
 fn crates(db: &dyn FilesGroup) -> Vec<CrateId> {
     // TODO(spapini): Sort for stability.
-    db.crate_roots().keys().copied().collect()
+    db.crate_configs().keys().copied().collect()
 }
-fn crate_root_dir(db: &dyn FilesGroup, crt: CrateId) -> Option<Directory> {
-    db.crate_roots().get(&crt).cloned()
+fn crate_config(db: &dyn FilesGroup, crt: CrateId) -> Option<CrateConfiguration> {
+    match db.lookup_intern_crate(crt) {
+        CrateLongId::Real(_) => db.crate_configs().get(&crt).cloned(),
+        CrateLongId::Virtual { name: _, config } => Some(config),
+    }
+}
+
+
+// read file and return a Result
+fn read_file_on_disk_or_wasm(path: PathBuf) -> Result<String> {
+    // println!("Reading file {:?}", path);
+    let full_path_str = path.to_str().unwrap();
+    if let Some(start) = full_path_str.find("corelib/src/") {
+        // Use slicing to get the part of the string after the target string
+        let remaining = &full_path_str[start + "corelib/src/".len()..];
+        let file = Asset::get(remaining).unwrap();
+        return Ok(std::str::from_utf8(file.data.as_ref()).unwrap().to_string());
+    }
+    return fs::read_to_string(path);
 }
 
 fn priv_raw_file_content(db: &dyn FilesGroup, file: FileId) -> Option<Arc<String>> {
     match db.lookup_intern_file(file) {
-        FileLongId::OnDisk(path) => match fs::read_to_string(path) {
+        FileLongId::OnDisk(path) => match read_file_on_disk_or_wasm(path) {
             Ok(content) => Some(Arc::new(content)),
             Err(_) => None,
         },
@@ -157,4 +277,23 @@ fn file_summary(db: &dyn FilesGroup, file: FileId) -> Option<Arc<FileSummary>> {
 }
 fn get_flag(db: &dyn FilesGroup, id: FlagId) -> Option<Arc<Flag>> {
     db.flags().get(&id).cloned()
+}
+
+/// Returns the location of the originating user code.
+pub fn get_originating_location(
+    db: &dyn FilesGroup,
+    mut file_id: FileId,
+    mut span: TextSpan,
+) -> (FileId, TextSpan) {
+    while let FileLongId::Virtual(VirtualFile { parent: Some(parent), code_mappings, .. }) =
+        db.lookup_intern_file(file_id)
+    {
+        if let Some(origin) = code_mappings.iter().find_map(|mapping| mapping.translate(span)) {
+            span = origin;
+            file_id = parent;
+        } else {
+            break;
+        }
+    }
+    (file_id, span)
 }

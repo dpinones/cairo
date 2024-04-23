@@ -1,23 +1,27 @@
 use std::sync::Arc;
 
-use cairo_lang_defs::ids::{LanguageElementId, MemberId, MemberLongId, StructId};
+use cairo_lang_defs::ids::{
+    LanguageElementId, LookupItemId, MemberId, MemberLongId, ModuleItemId, StructId,
+};
 use cairo_lang_diagnostics::{Diagnostics, Maybe, ToMaybe};
 use cairo_lang_proc_macros::{DebugWithDb, SemanticObject};
 use cairo_lang_syntax::attribute::structured::{Attribute, AttributeListStructurize};
-use cairo_lang_syntax::node::{Terminal, TypedSyntaxNode};
+use cairo_lang_syntax::node::{Terminal, TypedStablePtr, TypedSyntaxNode};
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::Upcast;
 use smol_str::SmolStr;
 
-use super::generics::semantic_generic_params;
+use super::generics::{semantic_generic_params, GenericParamsData};
+use super::visibility::Visibility;
 use crate::db::SemanticGroup;
 use crate::diagnostic::SemanticDiagnosticKind::*;
 use crate::diagnostic::SemanticDiagnostics;
 use crate::expr::inference::canonic::ResultNoErrEx;
+use crate::expr::inference::InferenceId;
 use crate::resolve::{Resolver, ResolverData};
 use crate::substitution::{GenericSubstitution, SemanticRewriter, SubstitutionRewriter};
 use crate::types::{resolve_type, ConcreteStructId};
-use crate::{semantic, SemanticDiagnostic};
+use crate::{semantic, GenericParam, SemanticDiagnostic};
 
 #[cfg(test)]
 #[path = "structure_test.rs"]
@@ -41,35 +45,33 @@ pub fn priv_struct_declaration_data(
     struct_id: StructId,
 ) -> Maybe<StructDeclarationData> {
     let module_file_id = struct_id.module_file_id(db.upcast());
-    let mut diagnostics = SemanticDiagnostics::new(module_file_id);
+    let mut diagnostics = SemanticDiagnostics::new(module_file_id.file_id(db.upcast())?);
     // TODO(spapini): when code changes in a file, all the AST items change (as they contain a path
     // to the green root that changes. Once ASTs are rooted on items, use a selector that picks only
     // the item instead of all the module data.
     // TODO(spapini): Add generic args when they are supported on structs.
-    let module_structs = db.module_structs(module_file_id.0)?;
-    let struct_ast = module_structs.get(&struct_id).to_maybe()?;
+    let struct_ast = db.module_struct_by_id(struct_id)?.to_maybe()?;
     let syntax_db = db.upcast();
 
     // Generic params.
-    let mut resolver = Resolver::new(db, module_file_id);
-    let generic_params = semantic_generic_params(
+    let generic_params_data = db.struct_generic_params_data(struct_id)?;
+    let generic_params = generic_params_data.generic_params;
+    let inference_id = InferenceId::LookupItemDeclaration(LookupItemId::ModuleItem(
+        ModuleItemId::Struct(struct_id),
+    ));
+    let mut resolver = Resolver::with_data(
         db,
-        &mut diagnostics,
-        &mut resolver,
-        module_file_id,
-        &struct_ast.generic_params(db.upcast()),
-        false,
-    )?;
+        (*generic_params_data.resolver_data).clone_with_inference_id(db, inference_id),
+    );
+    diagnostics.diagnostics.extend(generic_params_data.diagnostics);
 
     let attributes = struct_ast.attributes(syntax_db).structurize(syntax_db);
 
     // Check fully resolved.
-    if let Some((stable_ptr, inference_err)) = resolver.inference().finalize() {
-        inference_err
-            .report(&mut diagnostics, stable_ptr.unwrap_or(struct_ast.stable_ptr().untyped()));
-    }
-    let generic_params = resolver.inference().rewrite(generic_params).no_err();
+    let inference = &mut resolver.inference();
+    inference.finalize(&mut diagnostics, struct_ast.stable_ptr().untyped());
 
+    let generic_params = inference.rewrite(generic_params).no_err();
     let resolver_data = Arc::new(resolver.data);
     Ok(StructDeclarationData {
         diagnostics: diagnostics.build(),
@@ -91,8 +93,39 @@ pub fn struct_declaration_diagnostics(
 pub fn struct_generic_params(
     db: &dyn SemanticGroup,
     struct_id: StructId,
-) -> Maybe<Vec<semantic::GenericParam>> {
-    Ok(db.priv_struct_declaration_data(struct_id)?.generic_params)
+) -> Maybe<Vec<GenericParam>> {
+    db.struct_generic_params_data(struct_id).map(|data| data.generic_params)
+}
+
+/// Query implementation of [crate::db::SemanticGroup::struct_generic_params_data].
+pub fn struct_generic_params_data(
+    db: &dyn SemanticGroup,
+    struct_id: StructId,
+) -> Maybe<GenericParamsData> {
+    let module_file_id = struct_id.module_file_id(db.upcast());
+    let mut diagnostics = SemanticDiagnostics::new(module_file_id.file_id(db.upcast())?);
+    // TODO(spapini): when code changes in a file, all the AST items change (as they contain a path
+    // to the green root that changes. Once ASTs are rooted on items, use a selector that picks only
+    // the item instead of all the module data.
+    // TODO(spapini): Add generic args when they are supported on structs.
+    let struct_ast = db.module_struct_by_id(struct_id)?.to_maybe()?;
+    // Generic params.
+    let inference_id =
+        InferenceId::LookupItemGenerics(LookupItemId::ModuleItem(ModuleItemId::Struct(struct_id)));
+    let mut resolver = Resolver::new(db, module_file_id, inference_id);
+    let generic_params = semantic_generic_params(
+        db,
+        &mut diagnostics,
+        &mut resolver,
+        module_file_id,
+        &struct_ast.generic_params(db.upcast()),
+    )?;
+    let inference = &mut resolver.inference();
+    inference.finalize(&mut diagnostics, struct_ast.stable_ptr().untyped());
+
+    let generic_params = inference.rewrite(generic_params).no_err();
+    let resolver_data = Arc::new(resolver.data);
+    Ok(GenericParamsData { generic_params, diagnostics: diagnostics.build(), resolver_data })
 }
 
 /// Query implementation of [crate::db::SemanticGroup::struct_attributes].
@@ -116,11 +149,13 @@ pub struct StructDefinitionData {
     members: OrderedHashMap<SmolStr, Member>,
     resolver_data: Arc<ResolverData>,
 }
-#[derive(Clone, Debug, Hash, PartialEq, Eq, DebugWithDb, SemanticObject)]
+#[derive(Clone, Debug, PartialEq, Eq, DebugWithDb, SemanticObject)]
 #[debug_db(dyn SemanticGroup + 'static)]
 pub struct Member {
     pub id: MemberId,
     pub ty: semantic::TypeId,
+    #[dont_rewrite]
+    pub visibility: Visibility,
 }
 
 /// Query implementation of [crate::db::SemanticGroup::priv_struct_definition_data].
@@ -129,21 +164,24 @@ pub fn priv_struct_definition_data(
     struct_id: StructId,
 ) -> Maybe<StructDefinitionData> {
     let module_file_id = struct_id.module_file_id(db.upcast());
-    let mut diagnostics = SemanticDiagnostics::new(module_file_id);
+    let mut diagnostics = SemanticDiagnostics::new(module_file_id.file_id(db.upcast())?);
     // TODO(spapini): when code changes in a file, all the AST items change (as they contain a path
     // to the green root that changes. Once ASTs are rooted on items, use a selector that picks only
     // the item instead of all the module data.
     // TODO(spapini): Add generic args when they are supported on structs.
-    let module_structs = db.module_structs(module_file_id.0)?;
-    let struct_ast = module_structs.get(&struct_id).to_maybe()?;
+    let struct_ast = db.module_struct_by_id(struct_id)?.to_maybe()?;
     let syntax_db = db.upcast();
 
     // Generic params.
-    let mut resolver = Resolver::new(db, module_file_id);
-    let generic_params = db.struct_generic_params(struct_id)?;
-    for generic_param in generic_params {
-        resolver.add_generic_param(generic_param);
-    }
+    let generic_params_data = db.struct_generic_params_data(struct_id)?;
+    let inference_id = InferenceId::LookupItemDefinition(LookupItemId::ModuleItem(
+        ModuleItemId::Struct(struct_id),
+    ));
+    let mut resolver = Resolver::with_data(
+        db,
+        (*generic_params_data.resolver_data).clone_with_inference_id(db, inference_id),
+    );
+    diagnostics.diagnostics.extend(generic_params_data.diagnostics);
 
     // Members.
     let mut members = OrderedHashMap::default();
@@ -155,19 +193,25 @@ pub fn priv_struct_definition_data(
             &mut resolver,
             &member.type_clause(syntax_db).ty(syntax_db),
         );
+        let visibility = Visibility::from_ast(
+            syntax_db,
+            &mut diagnostics.diagnostics,
+            &member.visibility(syntax_db),
+        );
         let member_name = member.name(syntax_db).text(syntax_db);
-        if let Some(_other_member) = members.insert(member_name.clone(), Member { id, ty }) {
+        if let Some(_other_member) =
+            members.insert(member_name.clone(), Member { id, ty, visibility })
+        {
             diagnostics.report(&member, StructMemberRedefinition { struct_id, member_name });
         }
     }
 
     // Check fully resolved.
-    if let Some((stable_ptr, inference_err)) = resolver.inference().finalize() {
-        inference_err
-            .report(&mut diagnostics, stable_ptr.unwrap_or(struct_ast.stable_ptr().untyped()));
-    }
+    let inference = &mut resolver.inference();
+    inference.finalize(&mut diagnostics, struct_ast.stable_ptr().untyped());
+
     for (_, member) in members.iter_mut() {
-        member.ty = resolver.inference().rewrite(member.ty).no_err();
+        member.ty = inference.rewrite(member.ty).no_err();
     }
 
     let resolver_data = Arc::new(resolver.data);

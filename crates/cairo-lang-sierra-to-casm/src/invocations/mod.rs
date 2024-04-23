@@ -4,7 +4,8 @@ use cairo_lang_casm::builder::{CasmBuildResult, CasmBuilder, Var};
 use cairo_lang_casm::cell_expression::CellExpression;
 use cairo_lang_casm::instructions::Instruction;
 use cairo_lang_casm::operand::{CellRef, Register};
-use cairo_lang_sierra::extensions::core::CoreConcreteLibfunc;
+use cairo_lang_sierra::extensions::core::CoreConcreteLibfunc::{self, *};
+use cairo_lang_sierra::extensions::coupon::CouponConcreteLibfunc;
 use cairo_lang_sierra::extensions::gas::CostTokenType;
 use cairo_lang_sierra::extensions::lib_func::{BranchSignature, OutputVarInfo, SierraApChange};
 use cairo_lang_sierra::extensions::{ConcreteLibfunc, OutputVarReferenceInfo};
@@ -17,9 +18,10 @@ use cairo_lang_sierra_gas::core_libfunc_cost::{core_libfunc_cost, InvocationCost
 use cairo_lang_sierra_gas::objects::ConstCost;
 use cairo_lang_sierra_type_size::TypeSizeMap;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
+use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use itertools::{chain, zip_eq, Itertools};
+use num_bigint::BigInt;
 use thiserror::Error;
-use {cairo_lang_casm, cairo_lang_sierra};
 
 use crate::environment::frame_state::{FrameState, FrameStateError};
 use crate::environment::Environment;
@@ -34,10 +36,12 @@ mod array;
 mod bitwise;
 mod boolean;
 mod boxing;
+mod bytes31;
 mod casts;
+mod const_type;
 mod debug;
 mod ec;
-mod enm;
+pub mod enm;
 mod felt252;
 mod felt252_dict;
 mod function_call;
@@ -48,6 +52,7 @@ mod misc;
 mod nullable;
 mod pedersen;
 mod poseidon;
+mod range_reduction;
 mod starknet;
 mod structure;
 
@@ -78,6 +83,9 @@ pub enum InvocationError {
     IntegerOverflow,
     #[error(transparent)]
     FrameStateError(#[from] FrameStateError),
+    // TODO(lior): Remove this error once not used.
+    #[error("This libfunc does not support pre-cost metadata yet.")]
+    PreCostMetadataNotSupported,
 }
 
 /// Describes a simple change in the ap tracking itself.
@@ -93,7 +101,7 @@ pub enum ApTrackingChange {
 
 /// Describes the changes to the set of references at a single branch target, as well as changes to
 /// the environment.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchChanges {
     /// New references defined at a given branch.
     /// should correspond to BranchInfo.results.
@@ -131,49 +139,43 @@ impl BranchChanges {
             !matches!(&branch_signature.ap_change, SierraApChange::Known { new_vars_only: true });
         let stack_base = if clear_old_stack { 0 } else { prev_env.stack_size };
         let mut new_stack_size = stack_base;
-        Self {
-            refs: zip_eq(expressions, &branch_signature.vars)
-                .enumerate()
-                .map(|(output_idx, (expression, OutputVarInfo { ref_info, ty }))| {
-                    validate_output_var_refs(ref_info, &expression);
-                    let stack_idx = calc_output_var_stack_idx(
-                        ref_info,
-                        stack_base,
-                        clear_old_stack,
-                        &param_ref,
-                    );
-                    if let Some(stack_idx) = stack_idx {
-                        new_stack_size = new_stack_size.max(stack_idx + 1);
-                    }
-                    let introduction_point =
-                        if let OutputVarReferenceInfo::SameAsParam { param_idx } = ref_info {
-                            OutputReferenceValueIntroductionPoint::Existing(
-                                param_ref(*param_idx).introduction_point.clone(),
-                            )
-                        } else {
-                            // Marking the statement as unknown to be fixed later.
-                            OutputReferenceValueIntroductionPoint::New(output_idx)
-                        };
-                    OutputReferenceValue {
-                        expression,
-                        ty: ty.clone(),
-                        stack_idx,
-                        introduction_point,
-                    }
-                })
-                .collect(),
-            ap_change,
-            ap_tracking_change,
-            gas_change,
-            clear_old_stack,
-            new_stack_size,
-        }
+
+        let refs: Vec<_> = zip_eq(expressions, &branch_signature.vars)
+            .enumerate()
+            .map(|(output_idx, (expression, OutputVarInfo { ref_info, ty }))| {
+                validate_output_var_refs(ref_info, &expression);
+                let stack_idx =
+                    calc_output_var_stack_idx(ref_info, stack_base, clear_old_stack, &param_ref);
+                if let Some(stack_idx) = stack_idx {
+                    new_stack_size = new_stack_size.max(stack_idx + 1);
+                }
+                let introduction_point =
+                    if let OutputVarReferenceInfo::SameAsParam { param_idx } = ref_info {
+                        OutputReferenceValueIntroductionPoint::Existing(
+                            param_ref(*param_idx).introduction_point.clone(),
+                        )
+                    } else {
+                        // Marking the statement as unknown to be fixed later.
+                        OutputReferenceValueIntroductionPoint::New(output_idx)
+                    };
+                OutputReferenceValue { expression, ty: ty.clone(), stack_idx, introduction_point }
+            })
+            .collect();
+        validate_stack_top(ap_change, branch_signature, &refs);
+        Self { refs, ap_change, ap_tracking_change, gas_change, clear_old_stack, new_stack_size }
     }
 }
 
 /// Validates that a new temp or local var have valid references in their matching expression.
 fn validate_output_var_refs(ref_info: &OutputVarReferenceInfo, expression: &ReferenceExpression) {
     match ref_info {
+        OutputVarReferenceInfo::SameAsParam { .. } => {}
+        _ if expression.cells.is_empty() => {
+            assert_matches!(ref_info, OutputVarReferenceInfo::ZeroSized);
+        }
+        OutputVarReferenceInfo::ZeroSized => {
+            unreachable!("Non empty ReferenceExpression for zero sized variable.")
+        }
         OutputVarReferenceInfo::NewTempVar { .. } => {
             expression.cells.iter().for_each(|cell| {
                 assert_matches!(cell, CellExpression::Deref(CellRef { register: Register::AP, .. }))
@@ -190,10 +192,55 @@ fn validate_output_var_refs(ref_info: &OutputVarReferenceInfo, expression: &Refe
                 .iter()
                 .for_each(|cell| assert_matches!(cell, CellExpression::Deref(_)));
         }
-        OutputVarReferenceInfo::SameAsParam { .. }
-        | OutputVarReferenceInfo::PartialParam { .. }
-        | OutputVarReferenceInfo::Deferred(_) => {}
+        OutputVarReferenceInfo::PartialParam { .. } | OutputVarReferenceInfo::Deferred(_) => {}
     };
+}
+
+/// Validates that the variables that are now on the top of the stack are contiguous and that if the
+/// stack was not broken the size of all the variables is consistent with the ap change.
+fn validate_stack_top(
+    ap_change: ApChange,
+    branch_signature: &BranchSignature,
+    refs: &[OutputReferenceValue],
+) {
+    // A mapping for the new temp vars allocated on the top of the stack from their index on the
+    // top of the stack to their index in the `refs` vector.
+    let stack_top_vars = UnorderedHashMap::<usize, usize>::from_iter(
+        branch_signature.vars.iter().enumerate().filter_map(|(arg_idx, var)| {
+            if let OutputVarReferenceInfo::NewTempVar { idx: stack_idx } = var.ref_info {
+                Some((stack_idx, arg_idx))
+            } else {
+                None
+            }
+        }),
+    );
+    let mut prev_ap_offset = None;
+    let mut stack_top_size = 0;
+    for i in 0..stack_top_vars.len() {
+        let Some(arg) = stack_top_vars.get(&i) else {
+            panic!("Missing top stack var #{i} out of {}.", stack_top_vars.len());
+        };
+        let cells = &refs[*arg].expression.cells;
+        stack_top_size += cells.len();
+        for cell in cells {
+            let ap_offset = match cell {
+                CellExpression::Deref(CellRef { register: Register::AP, offset }) => *offset,
+                _ => unreachable!("Tested in `validate_output_var_refs`."),
+            };
+            if let Some(prev_ap_offset) = prev_ap_offset {
+                assert_eq!(ap_offset, prev_ap_offset + 1, "Top stack vars are not contiguous.");
+            }
+            prev_ap_offset = Some(ap_offset);
+        }
+    }
+    if matches!(branch_signature.ap_change, SierraApChange::Known { new_vars_only: true }) {
+        assert_eq!(
+            ap_change,
+            ApChange::Known(stack_top_size),
+            "New tempvar variables are not contiguous with the old stack."
+        );
+    }
+    // TODO(orizi): Add assertion for the non-new_vars_only case, that it is optimal.
 }
 
 /// Calculates the continuous stack index for an output var of a branch.
@@ -213,7 +260,8 @@ fn calc_output_var_stack_idx<'a, ParamRef: Fn(usize) -> &'a ReferenceValue>(
         | OutputVarReferenceInfo::SimpleDerefs
         | OutputVarReferenceInfo::NewLocalVar
         | OutputVarReferenceInfo::PartialParam { .. }
-        | OutputVarReferenceInfo::Deferred(_) => None,
+        | OutputVarReferenceInfo::Deferred(_)
+        | OutputVarReferenceInfo::ZeroSized => None,
     }
 }
 
@@ -441,12 +489,17 @@ impl CompiledInvocationBuilder<'_> {
     ) -> CompiledInvocation {
         let CasmBuildResult { instructions, branches } =
             casm_builder.build(branch_extractions.map(|(name, _, _)| name));
-        itertools::assert_equal(
-            core_libfunc_ap_change(self.libfunc, &self),
-            branches
-                .iter()
-                .map(|(state, _)| cairo_lang_sierra_ap_change::ApChange::Known(state.ap_change)),
-        );
+        let expected_ap_changes = core_libfunc_ap_change(self.libfunc, &self);
+        let actual_ap_changes = branches
+            .iter()
+            .map(|(state, _)| cairo_lang_sierra_ap_change::ApChange::Known(state.ap_change));
+        if !itertools::equal(expected_ap_changes.iter().cloned(), actual_ap_changes.clone()) {
+            panic!(
+                "Wrong ap changes for {}. Expected: {expected_ap_changes:?}, actual: {:?}.",
+                self.invocation,
+                actual_ap_changes.collect_vec(),
+            );
+        }
         let gas_changes =
             core_libfunc_cost(&self.program_info.metadata.gas_info, &self.idx, self.libfunc, &self)
                 .into_iter()
@@ -478,9 +531,11 @@ impl CompiledInvocationBuilder<'_> {
             });
         if !itertools::equal(gas_changes.clone(), final_costs_with_extra.clone()) {
             panic!(
-                "Wrong costs for {}. Expected: {gas_changes:?}, actual: \
-                 {final_costs_with_extra:?}.",
-                self.invocation
+                "Wrong costs for {}. Expected: {:?}, actual: {:?}, Costs from casm_builder: {:?}.",
+                self.invocation,
+                gas_changes.collect_vec(),
+                final_costs_with_extra.collect_vec(),
+                final_costs,
             );
         }
         let branch_relocations = branches.iter().zip_eq(branch_extractions.iter()).flat_map(
@@ -497,13 +552,12 @@ impl CompiledInvocationBuilder<'_> {
             },
         );
         let relocations = chain!(pre_instructions.relocations, branch_relocations).collect();
-        let output_expressions = branches.into_iter().zip_eq(branch_extractions.into_iter()).map(
-            |((state, _), (_, vars, _))| {
+        let output_expressions =
+            zip_eq(branches, branch_extractions).map(|((state, _), (_, vars, _))| {
                 vars.iter().map(move |var_cells| ReferenceExpression {
                     cells: var_cells.iter().map(|cell| state.get_adjusted(*cell)).collect(),
                 })
-            },
-        );
+            });
         self.build(
             chain!(pre_instructions.instructions, instructions).collect(),
             relocations,
@@ -557,6 +611,8 @@ impl CompiledInvocationBuilder<'_> {
 pub struct ProgramInfo<'a> {
     pub metadata: &'a Metadata,
     pub type_sizes: &'a TypeSizeMap,
+    /// Returns the given a const type returns a vector of cells value representing it.
+    pub const_data_values: &'a dyn Fn(&ConcreteTypeId) -> Vec<BigInt>,
 }
 
 /// Given a Sierra invocation statement and concrete libfunc, creates a compiled casm representation
@@ -572,49 +628,66 @@ pub fn compile_invocation(
     let builder =
         CompiledInvocationBuilder { program_info, invocation, libfunc, idx, refs, environment };
     match libfunc {
-        CoreConcreteLibfunc::Felt252(libfunc) => felt252::build(libfunc, builder),
-        CoreConcreteLibfunc::Bitwise(_) => bitwise::build(builder),
-        CoreConcreteLibfunc::Bool(libfunc) => boolean::build(libfunc, builder),
-        CoreConcreteLibfunc::Cast(libfunc) => casts::build(libfunc, builder),
-        CoreConcreteLibfunc::Ec(libfunc) => ec::build(libfunc, builder),
-        CoreConcreteLibfunc::Uint8(libfunc) => {
-            int::unsigned::build_uint::<_, 0x100>(libfunc, builder)
+        Felt252(libfunc) => felt252::build(libfunc, builder),
+        Bool(libfunc) => boolean::build(libfunc, builder),
+        Cast(libfunc) => casts::build(libfunc, builder),
+        Ec(libfunc) => ec::build(libfunc, builder),
+        Uint8(libfunc) => int::unsigned::build_uint::<_, 0x100>(libfunc, builder),
+        Uint16(libfunc) => int::unsigned::build_uint::<_, 0x10000>(libfunc, builder),
+        Uint32(libfunc) => int::unsigned::build_uint::<_, 0x100000000>(libfunc, builder),
+        Uint64(libfunc) => int::unsigned::build_uint::<_, 0x10000000000000000>(libfunc, builder),
+        Uint128(libfunc) => int::unsigned128::build(libfunc, builder),
+        Uint256(libfunc) => int::unsigned256::build(libfunc, builder),
+        Uint512(libfunc) => int::unsigned512::build(libfunc, builder),
+        Sint8(libfunc) => {
+            int::signed::build_sint::<_, { i8::MIN as i128 }, { i8::MAX as i128 }>(libfunc, builder)
         }
-        CoreConcreteLibfunc::Uint16(libfunc) => {
-            int::unsigned::build_uint::<_, 0x10000>(libfunc, builder)
+        Sint16(libfunc) => {
+            int::signed::build_sint::<_, { i16::MIN as i128 }, { i16::MAX as i128 }>(
+                libfunc, builder,
+            )
         }
-        CoreConcreteLibfunc::Uint32(libfunc) => {
-            int::unsigned::build_uint::<_, 0x100000000>(libfunc, builder)
+        Sint32(libfunc) => {
+            int::signed::build_sint::<_, { i32::MIN as i128 }, { i32::MAX as i128 }>(
+                libfunc, builder,
+            )
         }
-        CoreConcreteLibfunc::Uint64(libfunc) => {
-            int::unsigned::build_uint::<_, 0x10000000000000000>(libfunc, builder)
+        Sint64(libfunc) => {
+            int::signed::build_sint::<_, { i64::MIN as i128 }, { i64::MAX as i128 }>(
+                libfunc, builder,
+            )
         }
-        CoreConcreteLibfunc::Uint128(libfunc) => int::unsigned128::build(libfunc, builder),
-        CoreConcreteLibfunc::Uint256(libfunc) => int::unsigned256::build(libfunc, builder),
-        CoreConcreteLibfunc::Uint512(libfunc) => int::unsigned512::build(libfunc, builder),
-        CoreConcreteLibfunc::Gas(libfunc) => gas::build(libfunc, builder),
-        CoreConcreteLibfunc::BranchAlign(_) => misc::build_branch_align(builder),
-        CoreConcreteLibfunc::Array(libfunc) => array::build(libfunc, builder),
-        CoreConcreteLibfunc::Drop(_) => misc::build_drop(builder),
-        CoreConcreteLibfunc::Dup(_) => misc::build_dup(builder),
-        CoreConcreteLibfunc::Mem(libfunc) => mem::build(libfunc, builder),
-        CoreConcreteLibfunc::UnwrapNonZero(_) => misc::build_identity(builder),
-        CoreConcreteLibfunc::FunctionCall(libfunc) => function_call::build(libfunc, builder),
-        CoreConcreteLibfunc::UnconditionalJump(_) => misc::build_jump(builder),
-        CoreConcreteLibfunc::ApTracking(_) => misc::build_update_ap_tracking(builder),
-        CoreConcreteLibfunc::Box(libfunc) => boxing::build(libfunc, builder),
-        CoreConcreteLibfunc::Enum(libfunc) => enm::build(libfunc, builder),
-        CoreConcreteLibfunc::Struct(libfunc) => structure::build(libfunc, builder),
-        CoreConcreteLibfunc::Felt252Dict(libfunc) => felt252_dict::build_dict(libfunc, builder),
-        CoreConcreteLibfunc::Pedersen(libfunc) => pedersen::build(libfunc, builder),
-        CoreConcreteLibfunc::Poseidon(libfunc) => poseidon::build(libfunc, builder),
-        CoreConcreteLibfunc::StarkNet(libfunc) => starknet::build(libfunc, builder),
-        CoreConcreteLibfunc::Nullable(libfunc) => nullable::build(libfunc, builder),
-        CoreConcreteLibfunc::Debug(libfunc) => debug::build(libfunc, builder),
-        CoreConcreteLibfunc::SnapshotTake(_) => misc::build_dup(builder),
-        CoreConcreteLibfunc::Felt252DictEntry(libfunc) => {
-            felt252_dict::build_entry(libfunc, builder)
-        }
+        Sint128(libfunc) => int::signed128::build(libfunc, builder),
+        Gas(libfunc) => gas::build(libfunc, builder),
+        BranchAlign(_) => misc::build_branch_align(builder),
+        Array(libfunc) => array::build(libfunc, builder),
+        Drop(_) => misc::build_drop(builder),
+        Dup(_) => misc::build_dup(builder),
+        Mem(libfunc) => mem::build(libfunc, builder),
+        UnwrapNonZero(_) => misc::build_identity(builder),
+        FunctionCall(libfunc) | CouponCall(libfunc) => function_call::build(libfunc, builder),
+        UnconditionalJump(_) => misc::build_jump(builder),
+        ApTracking(_) => misc::build_update_ap_tracking(builder),
+        Box(libfunc) => boxing::build(libfunc, builder),
+        Enum(libfunc) => enm::build(libfunc, builder),
+        Struct(libfunc) => structure::build(libfunc, builder),
+        Felt252Dict(libfunc) => felt252_dict::build_dict(libfunc, builder),
+        Pedersen(libfunc) => pedersen::build(libfunc, builder),
+        Poseidon(libfunc) => poseidon::build(libfunc, builder),
+        StarkNet(libfunc) => starknet::build(libfunc, builder),
+        Nullable(libfunc) => nullable::build(libfunc, builder),
+        Debug(libfunc) => debug::build(libfunc, builder),
+        SnapshotTake(_) => misc::build_dup(builder),
+        Felt252DictEntry(libfunc) => felt252_dict::build_entry(libfunc, builder),
+        Bytes31(libfunc) => bytes31::build(libfunc, builder),
+        Const(libfunc) => const_type::build(libfunc, builder),
+        Coupon(libfunc) => match libfunc {
+            CouponConcreteLibfunc::Buy(_) => Ok(builder
+                .build_only_reference_changes([ReferenceExpression::zero_sized()].into_iter())),
+            CouponConcreteLibfunc::Refund(_) => {
+                Ok(builder.build_only_reference_changes([].into_iter()))
+            }
+        },
     }
 }
 

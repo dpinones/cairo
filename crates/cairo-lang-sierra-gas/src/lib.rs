@@ -4,6 +4,7 @@
 
 use cairo_lang_eq_solver::Expr;
 use cairo_lang_sierra::extensions::core::{CoreConcreteLibfunc, CoreLibfunc, CoreType};
+use cairo_lang_sierra::extensions::coupon::CouponConcreteLibfunc;
 use cairo_lang_sierra::extensions::gas::{CostTokenType, GasConcreteLibfunc};
 use cairo_lang_sierra::ids::{ConcreteLibfuncId, ConcreteTypeId, FunctionId};
 use cairo_lang_sierra::program::{Program, Statement, StatementIdx};
@@ -12,6 +13,7 @@ use cairo_lang_sierra_type_size::{get_type_size_map, TypeSizeMap};
 use cairo_lang_utils::casts::IntoOrPanic;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::unordered_hash_set::UnorderedHashSet;
+use compute_costs::PostCostTypeEx;
 use core_libfunc_cost_base::InvocationCostInfoProvider;
 use core_libfunc_cost_expr::CostExprMap;
 use cost_expr::Var;
@@ -43,6 +45,10 @@ pub enum CostError {
     StatementOutOfBounds(StatementIdx),
     #[error("failed solving the symbol tables")]
     SolvingGasEquationFailed,
+    #[error("found an unexpected cycle during cost computation")]
+    UnexpectedCycle,
+    #[error("failed to enforce function cost")]
+    EnforceWalletValueFailed(StatementIdx),
 }
 
 /// Helper to implement the `InvocationCostInfoProvider` for the equation generation.
@@ -90,7 +96,7 @@ pub fn calc_gas_precost_info(
     function_set_costs: OrderedHashMap<FunctionId, OrderedHashMap<CostTokenType, i32>>,
 ) -> Result<GasInfo, CostError> {
     let registry = ProgramRegistry::<CoreType, CoreLibfunc>::new(program)?;
-    calc_gas_info_inner(
+    let mut info = calc_gas_info_inner(
         program,
         |statement_future_cost, idx, libfunc_id| -> Vec<OrderedHashMap<CostTokenType, Expr<Var>>> {
             let libfunc = registry
@@ -100,7 +106,27 @@ pub fn calc_gas_precost_info(
         },
         function_set_costs,
         &registry,
-    )
+    )?;
+    // Make `withdraw_gas` and `refund` libfuncs return 0 valued variables for all tokens.
+    for (i, statement) in program.statements.iter().enumerate() {
+        let Statement::Invocation(invocation) = statement else {
+            continue;
+        };
+        let Ok(libfunc) = registry.get_libfunc(&invocation.libfunc_id) else {
+            continue;
+        };
+        let is_withdraw_gas =
+            matches!(libfunc, CoreConcreteLibfunc::Gas(GasConcreteLibfunc::WithdrawGas(_)));
+        let is_refund =
+            matches!(libfunc, CoreConcreteLibfunc::Coupon(CouponConcreteLibfunc::Refund(_)));
+        if is_withdraw_gas || is_refund {
+            for token in CostTokenType::iter_precost() {
+                // Check that the variable was not assigned a value, and set it to zero.
+                assert_eq!(info.variable_values.insert((StatementIdx(i), *token), 0), None);
+            }
+        }
+    }
+    Ok(info)
 }
 
 /// Calculates gas pre-cost information for a given program - the gas costs of non-step tokens.
@@ -108,7 +134,7 @@ pub fn compute_precost_info(program: &Program) -> Result<GasInfo, CostError> {
     let registry = ProgramRegistry::<CoreType, CoreLibfunc>::new(program)?;
     let type_sizes = get_type_size_map(program, &registry).unwrap();
 
-    Ok(compute_costs::compute_costs(
+    compute_costs::compute_costs(
         program,
         &(|libfunc_id| {
             let core_libfunc = registry
@@ -117,10 +143,12 @@ pub fn compute_precost_info(program: &Program) -> Result<GasInfo, CostError> {
             core_libfunc_cost_base::core_libfunc_cost(core_libfunc, &type_sizes)
         }),
         &compute_costs::PreCostContext {},
-    ))
+        &Default::default(),
+    )
 }
 
 /// Calculates gas postcost information for a given program - the gas costs of step token.
+// TODO(lior): Remove this function once [compute_postcost_info] is used.
 pub fn calc_gas_postcost_info<ApChangeVarValue: Fn(StatementIdx) -> usize>(
     program: &Program,
     function_set_costs: OrderedHashMap<FunctionId, OrderedHashMap<CostTokenType, i32>>,
@@ -129,7 +157,7 @@ pub fn calc_gas_postcost_info<ApChangeVarValue: Fn(StatementIdx) -> usize>(
 ) -> Result<GasInfo, CostError> {
     let registry = ProgramRegistry::<CoreType, CoreLibfunc>::new(program)?;
     let type_sizes = get_type_size_map(program, &registry).unwrap();
-    calc_gas_info_inner(
+    let mut info = calc_gas_info_inner(
         program,
         |statement_future_cost, idx, libfunc_id| {
             let libfunc = registry
@@ -142,7 +170,7 @@ pub fn calc_gas_postcost_info<ApChangeVarValue: Fn(StatementIdx) -> usize>(
                 &InvocationCostInfoProviderForEqGen {
                     type_sizes: &type_sizes,
                     token_usages: |token_type| {
-                        precost_gas_info.variable_values[(*idx, token_type)].into_or_panic()
+                        precost_gas_info.variable_values[&(*idx, token_type)].into_or_panic()
                     },
                     ap_change_var_value: || ap_change_var_value(*idx),
                 },
@@ -150,7 +178,26 @@ pub fn calc_gas_postcost_info<ApChangeVarValue: Fn(StatementIdx) -> usize>(
         },
         function_set_costs,
         &registry,
-    )
+    )?;
+    // Make `refund` libfuncs return 0 valued variables for all tokens.
+    for (i, statement) in program.statements.iter().enumerate() {
+        let Statement::Invocation(invocation) = statement else {
+            continue;
+        };
+        let Ok(libfunc) = registry.get_libfunc(&invocation.libfunc_id) else {
+            continue;
+        };
+        let is_refund =
+            matches!(libfunc, CoreConcreteLibfunc::Coupon(CouponConcreteLibfunc::Refund(_)));
+        if is_refund {
+            // Check that the variable was not assigned a value, and set it to zero.
+            assert_eq!(
+                info.variable_values.insert((StatementIdx(i), CostTokenType::Const), 0),
+                None
+            );
+        }
+    }
+    Ok(info)
 }
 
 /// Calculates gas information. Used for both precost and postcost.
@@ -170,8 +217,8 @@ fn calc_gas_info_inner<
         .map(|f| f.entry_point)
         .collect();
     for (func_id, cost_terms) in function_set_costs {
-        for token_type in CostTokenType::iter() {
-            equations[*token_type].push(
+        for token_type in CostTokenType::iter_casm_tokens() {
+            equations[token_type].push(
                 Expr::from_var(Var::StatementFuture(
                     registry.get_function(&func_id)?.entry_point,
                     *token_type,
@@ -238,9 +285,14 @@ fn calc_gas_info_inner<
             if !function_costs.contains_key(id) {
                 function_costs.insert(id.clone(), OrderedHashMap::default());
             }
-            let value = solution[Var::StatementFuture(func.entry_point, token_type)];
-            if value != 0 {
-                function_costs.get_mut(id).unwrap().insert(token_type, value);
+            // The `None` case is of a function that can never actually be called, as it has no
+            // return, so solver for it would not actually be calculated. (Such a function may exist
+            // by receiving a never type and matching on it) The cost of the function is considered
+            // as 0.
+            if let Some(value) = solution.get(&Var::StatementFuture(func.entry_point, token_type)) {
+                if *value != 0 {
+                    function_costs.get_mut(id).unwrap().insert(token_type, *value);
+                }
             }
         }
         for (var, value) in solution {
@@ -254,4 +306,42 @@ fn calc_gas_info_inner<
         }
     }
     Ok(GasInfo { variable_values, function_costs })
+}
+
+/// Calculates gas postcost information for a given program.
+///
+/// `CostType` can be either `i32` to get the total gas cost for CASM generation,
+/// or `ConstCost` to get the separate components (steps, holes, range-checks).
+pub fn compute_postcost_info<CostType: PostCostTypeEx>(
+    program: &Program,
+    get_ap_change_fn: &dyn Fn(&StatementIdx) -> usize,
+    precost_gas_info: &GasInfo,
+    enforced_function_costs: &OrderedHashMap<FunctionId, CostType>,
+) -> Result<GasInfo, CostError> {
+    let registry = ProgramRegistry::<CoreType, CoreLibfunc>::new(program)?;
+    let type_size_map = get_type_size_map(program, &registry).unwrap();
+    let specific_cost_context =
+        compute_costs::PostcostContext { get_ap_change_fn, precost_gas_info };
+    compute_costs::compute_costs(
+        program,
+        &(|libfunc_id| {
+            let core_libfunc = registry
+                .get_libfunc(libfunc_id)
+                .expect("Program registry creation would have already failed.");
+            core_libfunc_cost_base::core_libfunc_cost(core_libfunc, &type_size_map)
+        }),
+        &specific_cost_context,
+        &enforced_function_costs
+            .iter()
+            .map(|(func, val)| {
+                (
+                    registry
+                        .get_function(func)
+                        .expect("Program registry creation would have already failed.")
+                        .entry_point,
+                    *val,
+                )
+            })
+            .collect(),
+    )
 }

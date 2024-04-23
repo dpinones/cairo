@@ -1,3 +1,4 @@
+use cairo_lang_defs::diagnostic_utils::StableLocation;
 use cairo_lang_diagnostics::Maybe;
 use cairo_lang_lowering as lowering;
 use cairo_lang_semantic::TypeId;
@@ -31,6 +32,11 @@ pub struct ExprGeneratorContext<'a> {
     ap_tracking_enabled: bool,
     /// Information about where AP tracking should be enabled and disabled.
     ap_tracking_configuration: ApTrackingConfiguration,
+
+    /// The current location for adding statements.
+    curr_cairo_location: Option<StableLocation>,
+    /// The accumulated statements for the expression.
+    statements: Vec<pre_sierra::StatementWithLocation>,
 }
 impl<'a> ExprGeneratorContext<'a> {
     /// Constructs an empty [ExprGeneratorContext].
@@ -52,6 +58,8 @@ impl<'a> ExprGeneratorContext<'a> {
             block_labels: OrderedHashMap::default(),
             ap_tracking_enabled: true,
             ap_tracking_configuration,
+            statements: vec![],
+            curr_cairo_location: None,
         }
     }
 
@@ -121,10 +129,13 @@ impl<'a> ExprGeneratorContext<'a> {
             SierraGenVar::UninitializedLocal(lowering_var) => {
                 let inner_type =
                     self.db.get_concrete_type_id(self.lowered.variables[lowering_var].ty)?;
-                self.db.intern_concrete_type(ConcreteTypeLongId {
-                    generic_id: UninitializedType::ID,
-                    generic_args: vec![GenericArg::Type(inner_type)],
-                })
+                self.db.intern_concrete_type(crate::db::SierraGeneratorTypeLongId::Regular(
+                    ConcreteTypeLongId {
+                        generic_id: UninitializedType::ID,
+                        generic_args: vec![GenericArg::Type(inner_type)],
+                    }
+                    .into(),
+                ))
             }
         })
     }
@@ -172,6 +183,26 @@ impl<'a> ExprGeneratorContext<'a> {
     pub fn should_disable_ap_tracking(&self, block_id: &BlockId) -> bool {
         self.ap_tracking_enabled
             && self.ap_tracking_configuration.disable_ap_tracking.contains(block_id)
+    }
+
+    /// Adds a statement for the expression.
+    pub fn push_statement(&mut self, statement: pre_sierra::Statement) {
+        self.statements.push(pre_sierra::StatementWithLocation {
+            statement,
+            location: self.curr_cairo_location,
+        });
+    }
+
+    /// Sets up a location for the next pushed statements.
+    pub fn maybe_set_cairo_location(&mut self, location: Option<StableLocation>) {
+        if let Some(location) = location {
+            self.curr_cairo_location = Some(location);
+        }
+    }
+
+    /// Returns the statements generated for the expression.
+    pub fn statements(self) -> Vec<pre_sierra::StatementWithLocation> {
+        self.statements
     }
 }
 

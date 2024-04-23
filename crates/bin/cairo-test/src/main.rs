@@ -1,16 +1,45 @@
 //! Compiles and runs a Cairo program.
 
-use anyhow::Ok;
-use cairo_lang_test_runner::TestRunner;
-use clap::Parser;
+use std::path::PathBuf;
 
-/// Command line args parser.
-/// Exits with 0/1 if the input is formatted correctly/incorrectly.
+use anyhow::Ok;
+use cairo_lang_compiler::project::check_compiler_path;
+use cairo_lang_test_runner::{wasm_cairo_interface::run_tests_with_input_string, RunProfilerConfig, TestRunConfig, TestRunner};
+use clap::{Parser, ValueEnum};
+use serde::Serialize;
+
+/// The clap-arg equivalent of [RunProfilerConfig].
+#[derive(ValueEnum, Clone, Default, Debug, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+enum RunProfilerConfigArg {
+    #[default]
+    None,
+    Cairo,
+    Sierra,
+}
+impl From<RunProfilerConfigArg> for RunProfilerConfig {
+    fn from(val: RunProfilerConfigArg) -> Self {
+        match val {
+            RunProfilerConfigArg::None => RunProfilerConfig::None,
+            RunProfilerConfigArg::Cairo => RunProfilerConfig::Cairo,
+            RunProfilerConfigArg::Sierra => RunProfilerConfig::Sierra,
+        }
+    }
+}
+
+/// Compiles a Cairo project and runs all the functions marked as `#[test]`.
+/// Exits with 1 if the compilation or run fails, otherwise 0.
 #[derive(Parser, Debug)]
 #[clap(version, verbatim_doc_comment)]
 struct Args {
-    /// The path to compile and run its tests.
-    path: String,
+    /// The Cairo project path to compile and run its tests.
+    path: PathBuf,
+    /// Whether path is a single file.
+    #[arg(short, long)]
+    single_file: bool,
+    /// Allows the compilation to succeed with warnings.
+    #[arg(long)]
+    allow_warnings: bool,
     /// The filter for the tests, running only tests containing the filter string.
     #[arg(short, long, default_value_t = String::default())]
     filter: String,
@@ -23,18 +52,45 @@ struct Args {
     /// Should we add the starknet plugin to run the tests.
     #[arg(long, default_value_t = false)]
     starknet: bool,
+    /// Whether to run the profiler, and what results to produce. See
+    /// [cairo_lang_test_runner::RunProfilerConfig]
+    #[clap(short, long, default_value_t, value_enum)]
+    run_profiler: RunProfilerConfigArg,
+    /// Should disable gas calculation.
+    #[arg(long)]
+    gas_disabled: bool,
+    /// Whether to print resource usage after each test.
+    #[arg(long, default_value_t = false)]
+    print_resource_usage: bool,
+    /// Input program string of Cairo code.
+    #[arg(long)]
+    input_program_string: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let runner = TestRunner::new(
-        &args.path,
-        &args.filter,
-        args.include_ignored,
-        args.ignored,
-        args.starknet,
-    )?;
+    // Check if args.path is a file or a directory.
+    // check_compiler_path(args.single_file, &args.path)?;
+
+    let config = TestRunConfig {
+        filter: args.filter,
+        ignored: args.ignored,
+        include_ignored: args.include_ignored,
+        run_profiler: args.run_profiler.into(),
+        gas_enabled: !args.gas_disabled,
+        print_resource_usage: args.print_resource_usage,
+    };
+
+    // if input_program_string is provided, use it instead of the file.
+    if let Some(input_program_string) = args.input_program_string {
+        let _ = run_tests_with_input_string(&input_program_string, args.allow_warnings, config.filter, config.include_ignored, config.ignored, args.starknet, String::new(), args.gas_disabled, config.print_resource_usage);
+        // let runner = TestRunner::new_with_string(&input_program_string, &args.path, args.starknet, args.allow_warnings, config)?;
+        // runner.run()?;
+        return Ok(());
+    }
+
+    let runner = TestRunner::new(&args.path, args.starknet, args.allow_warnings, config)?;
     runner.run()?;
 
     Ok(())

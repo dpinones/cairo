@@ -50,26 +50,25 @@ pub fn concretize_lowered(
                 Statement::EnumConstruct(stmt) => {
                     stmt.variant = rewriter.rewrite(stmt.variant.clone())?;
                 }
+                Statement::Const(stmt) => {
+                    stmt.value = rewriter.rewrite(stmt.value.clone())?;
+                }
                 Statement::Snapshot(_)
                 | Statement::Desnap(_)
-                | Statement::Literal(_)
                 | Statement::StructConstruct(_)
                 | Statement::StructDestructure(_) => {}
             }
         }
         if let FlatBlockEnd::Match { info } = &mut block.end {
-            match info {
-                crate::MatchInfo::Enum(s) => {
-                    for MatchArm { variant_id, .. } in s.arms.iter_mut() {
-                        *variant_id = rewriter.rewrite(variant_id.clone())?;
-                    }
-                }
+            for MatchArm { arm_selector: selector, .. } in match info {
+                crate::MatchInfo::Enum(s) => s.arms.iter_mut(),
                 crate::MatchInfo::Extern(s) => {
                     s.function = concretize_function(db, &mut rewriter, s.function)?;
-                    for MatchArm { variant_id, .. } in s.arms.iter_mut() {
-                        *variant_id = rewriter.rewrite(variant_id.clone())?;
-                    }
+                    s.arms.iter_mut()
                 }
+                crate::MatchInfo::Value(s) => s.arms.iter_mut(),
+            } {
+                *selector = rewriter.rewrite(selector.clone())?;
             }
         }
     }

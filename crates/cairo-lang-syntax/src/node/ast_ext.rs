@@ -7,7 +7,9 @@ use num_traits::Num;
 use smol_str::SmolStr;
 use unescaper::unescape;
 
-use super::{TerminalFalse, TerminalLiteralNumber, TerminalShortString, TerminalTrue};
+use super::{
+    TerminalFalse, TerminalLiteralNumber, TerminalShortString, TerminalString, TerminalTrue,
+};
 use crate::node::db::SyntaxGroup;
 use crate::node::Terminal;
 
@@ -49,7 +51,7 @@ impl TerminalLiteralNumber {
         };
 
         // Catch an edge case, where literal seems to have a suffix that is valid numeric part
-        // according to the radix. Interpret this as an untyped numer.
+        // according to the radix. Interpret this as an untyped number.
         // Example: 0x1_f32 is interpreted as 0x1F32 without suffix.
         if let Ok(value) = BigInt::from_str_radix(text, radix) {
             Some((value, None))
@@ -61,10 +63,7 @@ impl TerminalLiteralNumber {
                 }
                 None => (text, None),
             };
-
-            let value = BigInt::from_str_radix(text, radix).ok()?;
-            let suffix = suffix.map(SmolStr::new);
-            Some((value, suffix))
+            Some((BigInt::from_str_radix(text, radix).ok()?, suffix.map(SmolStr::new)))
         }
     }
 }
@@ -74,19 +73,7 @@ impl TerminalShortString {
     pub fn string_value(&self, db: &dyn SyntaxGroup) -> Option<String> {
         let text = self.text(db);
 
-        let mut text = text.as_str();
-        if text.starts_with('\'') {
-            (_, text) = text.split_once('\'').unwrap();
-        }
-        if let Some((body, _suffix)) = text.rsplit_once('\'') {
-            text = body;
-        }
-
-        let text = unescape(text).ok()?;
-
-        if !text.is_ascii() {
-            return None;
-        }
+        let (text, _suffix) = string_value(&text, '\'')?;
 
         Some(text)
     }
@@ -108,4 +95,35 @@ impl TerminalShortString {
         }
         Some(suffix.into())
     }
+}
+
+impl TerminalString {
+    /// Interpret this token/terminal as a string.
+    pub fn string_value(&self, db: &dyn SyntaxGroup) -> Option<String> {
+        let text = self.text(db);
+        let (text, suffix) = string_value(&text, '"')?;
+        if !suffix.is_empty() {
+            unreachable!();
+        }
+
+        Some(text)
+    }
+}
+
+/// Interpret the given text as a string with the given delimiter. Returns the text and the suffix.
+fn string_value(text: &str, delimiter: char) -> Option<(String, &str)> {
+    let (prefix, text) = text.split_once(delimiter)?;
+    if !prefix.is_empty() {
+        unreachable!();
+    }
+
+    let (text, suffix) = text.rsplit_once(delimiter)?;
+
+    let text = unescape(text).ok()?;
+
+    if !text.is_ascii() {
+        return None;
+    }
+
+    Some((text, suffix))
 }
