@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
+use cairo_lang_compiler::diagnostics::get_diagnostics_as_string;
 use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_compiler::diagnostics::DiagnosticsReporter;
 use cairo_lang_compiler::wasm_cairo_interface::setup_project_with_input_string;
@@ -83,7 +84,8 @@ impl TestCompiler {
             reporter = reporter.allow_warnings();
         }
         if reporter.check(db) {
-            bail!("failed to compile 5: {}", path.display());
+            let err_string = get_diagnostics_as_string(db, &[]);
+            anyhow::bail!("failed to compile 5:\n {}", err_string);
         }
 
         Ok(Self {
