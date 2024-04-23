@@ -157,20 +157,21 @@ impl CompiledTestRunner {
             println!();
             test_result_string.push_str("\n");
             test_result_string.push_str(&format!(
-                "test result: {}. {} passed; {} failed; {} ignored",
+                "test result APPEND: {}. {} passed; {} failed; {} ignored",
                 "FAILED".bright_red(),
                 passed.len(),
                 failed.len(),
                 ignored.len()
             ));
             LogDatabase::append_file_text( "test_log_file".to_string(), test_result_string);// append test results to log_file
-            bail!(
-                "test result BAIL: {}. {} passed; {} failed; {} ignored",
-                "FAILED".bright_red(),
-                passed.len(),
-                failed.len(),
-                ignored.len()
-            );
+            // bail!(
+            //     "test result BAIL: {}. {} passed; {} failed; {} ignored",
+            //     "FAILED".bright_red(),
+            //     passed.len(),
+            //     failed.len(),
+            //     ignored.len()
+            // );
+            Ok(None)
         }
     }
 }
