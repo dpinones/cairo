@@ -37,7 +37,7 @@ pub fn compile_cairo_project_with_input_string(
     if DiagnosticsReporter::stderr().check(&db) {
         // TODO: Check if this need extra crate ids.
         let err_string = get_diagnostics_as_string(&mut db, &[]);
-        anyhow::bail!("failed to compile:\n {}", err_string);
+        anyhow::bail!("failed to compile 1:\n {}", err_string);
     }
     Ok(compile_prepared_db(&mut db, main_crate_ids, compiler_config)?.program)
 }

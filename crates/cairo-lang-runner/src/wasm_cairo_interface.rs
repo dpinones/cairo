@@ -50,7 +50,7 @@ pub fn run_with_input_program_string(
 
      if reporter.check(db) {
         let err_string = get_diagnostics_as_string(db, &[]);
-        anyhow::bail!("failed to compile:\n {}", err_string);
+        anyhow::bail!("failed to compile 2:\n {}", err_string);
     }
     
     let SierraProgramWithDebug { program: sierra_program, debug_info } = Arc::unwrap_or_clone(
