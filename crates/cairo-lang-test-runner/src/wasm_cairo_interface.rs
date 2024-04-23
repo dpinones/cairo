@@ -83,7 +83,7 @@ impl TestCompiler {
             reporter = reporter.allow_warnings();
         }
         if reporter.check(db) {
-            bail!("failed to compile: {}", path.display());
+            bail!("failed to compile 5: {}", path.display());
         }
 
         Ok(Self {

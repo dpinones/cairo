@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         reporter = reporter.allow_warnings();
     }
     if reporter.check(db) {
-        anyhow::bail!("failed to compile: {}", args.path.display());
+        anyhow::bail!("failed to compile 3: {}", args.path.display());
     }
 
     let SierraProgramWithDebug { program: sierra_program, debug_info } = Arc::unwrap_or_clone(
