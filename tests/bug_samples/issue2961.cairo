@@ -1,9 +1,4 @@
-use serde::Serde;
-use traits::PartialEq;
-use clone::Clone;
-use array::ArrayTrait;
-use option::OptionTrait;
-use test::test_utils::{assert_eq, assert_ne};
+use core::test::test_utils::assert_eq;
 
 #[derive(Copy, PartialEq, Destruct, Serde)]
 struct SimpleStruct {

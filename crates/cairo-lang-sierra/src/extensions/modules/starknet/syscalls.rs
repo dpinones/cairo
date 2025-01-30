@@ -3,13 +3,16 @@ use itertools::chain;
 use super::interoperability::ClassHashType;
 use super::u64_span_ty;
 use crate::extensions::array::ArrayType;
+use crate::extensions::boxing::box_ty;
 use crate::extensions::felt252::Felt252Type;
 use crate::extensions::gas::GasBuiltinType;
+use crate::extensions::int::unsigned::Uint32Type;
 use crate::extensions::lib_func::{
     BranchSignature, DeferredOutputKind, LibfuncSignature, OutputVarInfo, ParamSignature,
     SierraApChange, SignatureSpecializationContext,
 };
 use crate::extensions::modules::get_u256_type;
+use crate::extensions::utils::fixed_size_array_ty;
 use crate::extensions::{
     NamedType, NoGenericArgsGenericLibfunc, NoGenericArgsGenericType, OutputVarReferenceInfo,
     SpecializationError,
@@ -154,4 +157,105 @@ impl SyscallGenericLibfunc for KeccakLibfunc {
     ) -> Result<Vec<crate::ids::ConcreteTypeId>, SpecializationError> {
         Ok(vec![get_u256_type(context)?])
     }
+}
+
+/// Type representing the sha256 state handle.
+#[derive(Default)]
+pub struct Sha256StateHandleType {}
+
+impl NoGenericArgsGenericType for Sha256StateHandleType {
+    const ID: GenericTypeId = GenericTypeId::new_inline("Sha256StateHandle");
+    const STORABLE: bool = true;
+    const DUPLICATABLE: bool = true;
+    const DROPPABLE: bool = true;
+    const ZERO_SIZED: bool = false;
+}
+
+/// Libfunc for the sha256_process_block system call.
+/// The input needs a Sha256StateHandleType for the previous state and a span of 16 words
+/// (each word is 32 bits).
+#[derive(Default)]
+pub struct Sha256ProcessBlockLibfunc {}
+impl SyscallGenericLibfunc for Sha256ProcessBlockLibfunc {
+    const STR_ID: &'static str = "sha256_process_block_syscall";
+
+    fn input_tys(
+        context: &dyn SignatureSpecializationContext,
+    ) -> Result<Vec<crate::ids::ConcreteTypeId>, SpecializationError> {
+        Ok(vec![
+            // Previous state of the hash.
+            context.get_concrete_type(Sha256StateHandleType::id(), &[])?,
+            // The current block to process.
+            boxed_u32_fixed_array_ty(context, 16)?,
+        ])
+    }
+
+    fn success_output_tys(
+        context: &dyn SignatureSpecializationContext,
+    ) -> Result<Vec<crate::ids::ConcreteTypeId>, SpecializationError> {
+        Ok(vec![context.get_concrete_type(Sha256StateHandleType::id(), &[])?])
+    }
+}
+
+/// Libfunc for converting a ContractAddress into a felt252.
+#[derive(Default)]
+pub struct Sha256StateHandleInitLibfunc {}
+impl NoGenericArgsGenericLibfunc for Sha256StateHandleInitLibfunc {
+    const STR_ID: &'static str = "sha256_state_handle_init";
+
+    fn specialize_signature(
+        &self,
+        context: &dyn SignatureSpecializationContext,
+    ) -> Result<LibfuncSignature, SpecializationError> {
+        Ok(LibfuncSignature::new_non_branch_ex(
+            vec![
+                ParamSignature::new(sha256_state_handle_unwrapped_type(context)?).with_allow_all(),
+            ],
+            vec![OutputVarInfo {
+                ty: context.get_concrete_type(Sha256StateHandleType::id(), &[])?,
+                ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::Generic),
+            }],
+            SierraApChange::Known { new_vars_only: false },
+        ))
+    }
+}
+
+/// Libfunc for converting a ContractAddress into a felt252.
+#[derive(Default)]
+pub struct Sha256StateHandleDigestLibfunc {}
+impl NoGenericArgsGenericLibfunc for Sha256StateHandleDigestLibfunc {
+    const STR_ID: &'static str = "sha256_state_handle_digest";
+
+    fn specialize_signature(
+        &self,
+        context: &dyn SignatureSpecializationContext,
+    ) -> Result<LibfuncSignature, SpecializationError> {
+        Ok(LibfuncSignature::new_non_branch_ex(
+            vec![
+                ParamSignature::new(context.get_concrete_type(Sha256StateHandleType::id(), &[])?)
+                    .with_allow_all(),
+            ],
+            vec![OutputVarInfo {
+                ty: sha256_state_handle_unwrapped_type(context)?,
+                ref_info: OutputVarReferenceInfo::Deferred(DeferredOutputKind::Generic),
+            }],
+            SierraApChange::Known { new_vars_only: false },
+        ))
+    }
+}
+
+/// The inner type of the Sha256StateHandle: `Box<[u32; 8]>`.
+pub fn sha256_state_handle_unwrapped_type(
+    context: &dyn SignatureSpecializationContext,
+) -> Result<ConcreteTypeId, SpecializationError> {
+    boxed_u32_fixed_array_ty(context, 8)
+}
+
+/// Returns `Box<[u32; size]>` according to the given size.
+fn boxed_u32_fixed_array_ty(
+    context: &dyn SignatureSpecializationContext,
+    size: i16,
+) -> Result<ConcreteTypeId, SpecializationError> {
+    let ty = context.get_concrete_type(Uint32Type::id(), &[])?;
+    box_ty(context, fixed_size_array_ty(context, ty, size)?)
 }

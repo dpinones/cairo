@@ -10,16 +10,16 @@ use crate::test_utils::{setup_test_module, SemanticDatabaseForTesting};
 
 #[test]
 fn test_struct() {
-    let mut db_val = SemanticDatabaseForTesting::default();
-    let db = &mut db_val;
+    let db_val = SemanticDatabaseForTesting::default();
+    let db = &db_val;
     let (test_module, diagnostics) = setup_test_module(
         db,
         indoc::indoc! {"
-            #[contract(MyImpl1, MyImpl2)]
+            #[inline(MyImpl1, MyImpl2)]
             struct A {
                 a: felt252,
-                b: (felt252, felt252),
-                c: (),
+                pub b: (felt252, felt252),
+                pub(crate) c: (),
                 a: (),
                 a: ()
             }
@@ -61,9 +61,9 @@ fn test_struct() {
     assert_eq!(
         actual,
         indoc! {"
-            a: Member { id: MemberId(test::a), ty: () },
-            b: Member { id: MemberId(test::b), ty: (core::felt252, core::felt252) },
-            c: Member { id: MemberId(test::c), ty: () }"}
+            a: Member { id: MemberId(test::a), ty: (), visibility: Private },
+            b: Member { id: MemberId(test::b), ty: (core::felt252, core::felt252), visibility: Public },
+            c: Member { id: MemberId(test::c), ty: (), visibility: PublicInCrate }"}
     );
 
     assert_eq!(
@@ -73,6 +73,6 @@ fn test_struct() {
             .map(|attr| format!("{:?}", attr.debug(db)))
             .collect::<Vec<_>>()
             .join(",\n"),
-        r#"Attribute { id: "contract", args: ["MyImpl1", "MyImpl2", ] }"#
+        r#"Attribute { id: "inline", args: ["MyImpl1", "MyImpl2", ] }"#
     );
 }

@@ -121,6 +121,7 @@ impl NoGenericArgsGenericLibfunc for EcCreatePointLibfunc {
 }
 
 /// Libfunc for creating an EC point from its x coordinate.
+///
 /// If there exists `y` such that `(x, y)` is on the curve, either `(x, y)` or `(x, -y)` (both
 /// constitute valid points on the curve) is returned.
 /// Otherwise, nothing is returned.
@@ -185,6 +186,7 @@ impl NoGenericArgsGenericLibfunc for EcUnwrapPointLibfunc {
             ty: felt252_ty,
             ref_info: OutputVarReferenceInfo::PartialParam { param_idx: 0 },
         };
+        // TODO(orizi): Consider making the returned `y` value non-zero.
         Ok(LibfuncSignature::new_non_branch(
             vec![nonzero_ecpoint_ty],
             vec![felt252_partial_param_0_output_info.clone(), felt252_partial_param_0_output_info],

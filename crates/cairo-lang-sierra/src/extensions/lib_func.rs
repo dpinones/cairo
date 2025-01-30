@@ -353,6 +353,7 @@ impl From<ConcreteTypeId> for ParamSignature {
 }
 
 /// Information regarding the reference created as an output of a library function.
+///
 /// For example, whether the reference is equal to one of the parameters (as in the dup() function),
 /// or whether it's newly allocated local variable.
 #[derive(Debug, Clone)]
@@ -379,6 +380,8 @@ pub enum OutputVarReferenceInfo {
     Deferred(DeferredOutputKind),
     /// All the output cells are of the form `[ap/fp + const]`. For example, `([ap + 1], [fp])`.
     SimpleDerefs,
+    /// The output is a of size 0.
+    ZeroSized,
 }
 
 /// The type of a deferred output.

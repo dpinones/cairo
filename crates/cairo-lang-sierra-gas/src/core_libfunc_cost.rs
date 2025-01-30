@@ -61,14 +61,14 @@ pub fn core_libfunc_cost<InfoProvider: InvocationCostInfoProvider>(
     libfunc: &CoreConcreteLibfunc,
     info_provider: &InfoProvider,
 ) -> Vec<Option<OrderedHashMap<CostTokenType, i64>>> {
-    let precost = core_libfunc_precost(&mut Ops { gas_info, idx: *idx }, libfunc);
+    let precost = core_libfunc_precost(&mut Ops { gas_info, idx: *idx }, libfunc, info_provider);
     let postcost = core_libfunc_postcost(&mut Ops { gas_info, idx: *idx }, libfunc, info_provider);
     zip_eq(precost, postcost)
         .map(|(precost, postcost)| {
             let precost = precost?;
             let postcost = postcost?;
             Some(
-                CostTokenType::iter()
+                CostTokenType::iter_casm_tokens()
                     .map(|token| {
                         (
                             *token,
