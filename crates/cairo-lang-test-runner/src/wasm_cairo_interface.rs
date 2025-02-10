@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
+use cairo_lang_compiler::diagnostics::get_diagnostics_as_string;
 use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_compiler::diagnostics::DiagnosticsReporter;
 use cairo_lang_compiler::wasm_cairo_interface::setup_project_with_input_string;
@@ -82,6 +83,16 @@ impl TestCompiler {
         // WASM-Cairo interface
         let main_crate_ids =
             setup_project_with_input_string(db, Path::new(&path), input_program_string)?;
+        
+        let mut reporter = DiagnosticsReporter::stderr().with_crates(&main_crate_ids);
+        if allow_warnings {
+            reporter = reporter.allow_warnings();
+        }
+
+        if reporter.check(db) {
+            let err_string = get_diagnostics_as_string(db, &[]);
+            anyhow::bail!("failed to compile :\n {}", err_string);
+        }
         
         Ok(Self {
             db: db.snapshot(),
