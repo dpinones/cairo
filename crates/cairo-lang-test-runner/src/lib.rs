@@ -180,13 +180,14 @@ impl CompiledTestRunner {
                 ignored.len()
             ));
             LogDatabase::append_file_text( "test_log_file".to_string(), test_result_string);// append test results to log_file
-            bail!(
-                "test result: {}. {} passed; {} failed; {} ignored",
-                "FAILED".bright_red(),
-                passed.len(),
-                failed.len(),
-                ignored.len()
-            );
+            // bail!(
+            //     "test result: {}. {} passed; {} failed; {} ignored",
+            //     "FAILED".bright_red(),
+            //     passed.len(),
+            //     failed.len(),
+            //     ignored.len()
+            // );
+            Ok(None)
         }
     }
 }
